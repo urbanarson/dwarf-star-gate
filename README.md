@@ -233,6 +233,17 @@ build system, CDN, analytics service or cloud telemetry.
 
 ## Dashboard
 
+By default the dashboard binds loopback: only browsers on the gateway host can
+reach it. For a headless gateway host with no display, the **Serve Dashboard on
+Local Network** switch in Settings rebinds it to every interface so any machine
+on the LAN can open it. The switch is deliberate about safety: it starts off,
+refuses to enable without a gateway API key, widens the existing DNS-rebinding
+fence only to exact private interface addresses (never a caller-chosen name),
+and requires non-loopback browsers to sign in once with the gateway API key and
+receive a 12-hour HttpOnly session cookie. Loopback scripts keep their
+location-based trust untouched. Enabling reports that the new bind takes effect
+after the next gateway restart; disabling protects immediately, even before.
+
 Machine [speed charts](docs/rate-charts.md) use consistent phase colours and
 separate fleet-record scales for prefill and decode.
 

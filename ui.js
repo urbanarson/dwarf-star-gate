@@ -1,0 +1,1438 @@
+import { capacity, phase } from './activity.js';
+import { buildCatalogue } from './fleet-catalogue.js';
+const $ = id => document.getElementById(id);
+const fmt = n => Number.isFinite(n) ? n.toLocaleString(undefined, { maximumFractionDigits: 1 }) : '—';
+const fmtWhole = n => Number.isFinite(n) ? Math.round(n).toLocaleString() : '—';
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+const age = (time, now) => !time ? 'no sample yet' : now - time < 5000 ? 'just now' : now - time < 60000 ? `${Math.floor((now-time)/1000)}s ago` : `${Math.floor((now-time)/60000)}m ago`;
+const remaining = (time, now) => !time ? 'unknown' : time <= now ? 'expired' : time-now < 60000 ? `${Math.ceil((time-now)/1000)}s` : time-now < 3600000 ? `${Math.ceil((time-now)/60000)}m` : `${(Math.ceil((time-now)/360000)/10).toFixed(1).replace(/\.0$/,'')}h`;
+const clock = t => {
+  if(!['string','number'].includes(typeof t))return 'unknown';
+  const date=new Date(t);
+  return Number.isFinite(date.getTime())?date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }):'unknown';
+};
+function knownWaiting(gateway,door) {
+  const core=Number.isSafeInteger(gateway?.queued)&&gateway.queued>=0?gateway.queued:0;
+  const held=door?.holding&&Number.isSafeInteger(door.held)&&door.held>=0?door.held:0;
+  return {core,held,total:core+held};
+}
+function thinkingInfo(t) {
+  if (!t) return { label:null, detail:'No thinking metadata observed.' };
+  if (t.status === 'pending') return { label:null, detail:'Waiting for the request upload to finish.' };
+  if (!['specified','not_specified'].includes(t.status)) return { label:null, detail:({capture_limit:'Upload exceeded the 8 MiB metadata observation budget. The full request still passes through unchanged.',encoded_body:'Encoded request body; not inspected.',invalid_json:'Request metadata could not be parsed.',incomplete_body:'Request upload did not finish.'})[t.reason] || 'Requested thinking metadata unavailable.' };
+  const detail = Object.entries(t.fields || {}).map(([k,v])=>`${k}=${v}`).join('; ') || 'No thinking controls supplied';
+  const requested=['chat_template_kwargs.reasoning_effort','reasoning_effort','reasoning.effort'].map(k=>t.fields?.[k]).find(v=>['none','minimal','low','medium','high','xhigh','max'].includes(v));
+  const enabled=t.fields?.['chat_template_kwargs.enable_thinking']??t.fields?.enable_thinking;
+  const mode=t.served?.basis==='ds4_request_rules' && ['none','minimal','low','medium','high','xhigh','max'].includes(t.served.mode) ? t.served.mode : null;
+  const level=mode??requested??(typeof enabled==='boolean'?(enabled?'on':'off'):null);
+  const shown=level==='none'?'Off':level?level.charAt(0).toUpperCase()+level.slice(1):null;
+  return {label:shown,detail:`Requested: ${detail}. ${mode?'Serving mode derived from backend request rules and server context; not an engine-reported measurement.':'Effective engine mode is not reported; this is the requested setting only.'}`};
+}
+function thinkingIndicator(w, stale, now) {
+  const current=thinkingInfo(w?.load?w.requested_thinking:w?.last_requested_thinking);
+  let info=current,qualifier=stale?'Stale':w?.load?'':'Last';
+  if(!current.label){const last=thinkingInfo(w?.last_requested_thinking);if(last.label){info=last;qualifier='Last';}}
+  const scope=stale?'Stale snapshot.':w?.load?'Each concurrent request retains its own requested thinking settings; this is the oldest active request\'s metadata.':w?.last_request_finished_at?`Last request · ${age(Date.parse(w.last_request_finished_at),now)}.`:'No request observed yet.';
+  return `<div class="requested-thinking" title="${esc(scope+' '+info.detail)}"><span class="label">Thinking:</span><strong>${esc(info.label??'—')}</strong>${qualifier?`<span class="thinking-scope">${qualifier}</span>`:''}${w?.load>1?`<span class="thinking-scope">${fmt(w.load)} active</span>`:''}</div>`;
+}
+function rateScales(devices,peaks,now){
+  const scales=Object.fromEntries(['prefill','decode'].map(kind=>{
+    const recorded=peaks?.[kind],values=[];
+    if(Number.isFinite(recorded?.tps)&&recorded.tps>0&&Number.isFinite(recorded.time)&&recorded.time<=now)values.push(recorded.tps);
+    for(const d of devices??[])for(const p of d.series??[])if(p.kind===kind&&Number.isFinite(p.tps)&&p.tps>0&&Number.isFinite(p.time)&&p.time<=now)values.push(p.tps);
+    return [kind,values.length?values.reduce((max,value)=>Math.max(max,value),0):1];
+  }));
+  scales.detail=`Fleet record scale, seeded from retained engine chunk-speed telemetry and preserved across dashboard restarts; deleted history before tracking cannot be reconstructed. Historical scan: ${peaks?.history_status??'unavailable'}.${peaks?.persistence_error?' Peak persistence unavailable; new records may not survive restart.':''}${peaks?.malformed_lines?' Some historical rows could not be read.':''} No samples uses a 0–1 placeholder.`;
+  return scales;
+}
+// Display-only trailing mean. Work on copies, retaining every raw observation.
+// Sparse samples expire by timestamp; smoothing never borrows future values.
+function smoothRates(samples) {
+  let start=0,sum=0;
+  return samples.map((sample,index)=>{
+    if(index&&sample.scope!==samples[index-1].scope){start=index;sum=0;}
+    sum+=sample.tps;
+    while(start<index&&samples[start].time<=sample.time-20000)sum-=samples[start++].tps;
+    return {...sample,tps:Math.max(0,sum/(index-start+1))};
+  });
+}
+function chart(series, kind, now, ceiling) {
+  const values = (series??[]).filter(s => s?.kind === kind && Number.isFinite(s.time) && Number.isFinite(s.tps) && s.tps>=0 && s.time<=now && now - s.time < 900000).sort((a,b)=>a.time-b.time);
+  const max = Number.isFinite(ceiling)&&ceiling>0?ceiling:Math.max(1, ...values.map(s => s.tps));
+  const groups=[];for(const sample of values){const current=groups.at(-1);if(!current||sample.time-current.at(-1).time>90000)groups.push([sample]);else current.push(sample);}
+  const first=values[0],last=values.at(-1),leading=first&&first.time-(now-900000)>90000,trailing=last&&now-last.time>90000;
+  const gapCount=Math.max(0,groups.length-1)+Number(!!leading)+Number(!!trailing),gapWidth=8;
+  const durations=groups.map(g=>Math.max(1,g.at(-1).time-g[0].time)),total=durations.reduce((sum,n)=>sum+n,0);
+  const available=294-gapCount*gapWidth,parts=[];let cursor=3,lastPoint=null;
+  const marker=(x,ms,scope)=>{
+    const label=`${Math.round(ms/1000)}s ${scope} collapsed. Idle-coloured separator marks missing rate measurements, not proof of idle; no interpolated speed.`;
+    return `<g class="chart-gap" tabindex="0" role="img" aria-label="${label}"><title>${label}</title><line class="chart-gap-line" x1="${x.toFixed(1)}" y1="8" x2="${x.toFixed(1)}" y2="52"/></g>`;
+  };
+  // Give each missing interval one narrow separator. Only measured runs get
+  // horizontal space; the x axis is deliberately not a shared wall-clock axis.
+  if(!first)parts.push(marker(150,900000,'without rate samples'));
+  if(leading){parts.push(marker(cursor+gapWidth/2,first.time-(now-900000),'before the first sample'));cursor+=gapWidth;}
+  groups.forEach((rawGroup,index)=>{
+    const group=smoothRates(rawGroup);
+    if(index){parts.push(marker(cursor+gapWidth/2,group[0].time-groups[index-1].at(-1).time,'between rate measurements'));cursor+=gapWidth;}
+    const width=available*durations[index]/total,start=group[0].time;
+    const point=s=>`${(cursor+(group.length===1?width/2:(s.time-start)/durations[index]*width)).toFixed(1)},${(52-s.tps/max*44).toFixed(1)}`;
+    lastPoint=point(group.at(-1)).split(',');
+    parts.push(group.length===1?`<circle class="chart-point" cx="${lastPoint[0]}" cy="${lastPoint[1]}" r="2.5"/>`:`<polyline points="${group.map(point).join(' ')}"/>`);
+    cursor+=width;
+  });
+  if(trailing)parts.push(marker(cursor+gapWidth/2,now-last.time,'since the last sample'));
+  else if(lastPoint)parts.push(`<circle class="chart-last" cx="${lastPoint[0]}" cy="${lastPoint[1]}" r="3.2"/>`);
+  return `<svg class="chart ${kind}" viewBox="0 0 300 60" preserveAspectRatio="none" role="img" aria-label="${kind} last 15 minutes, 20-second rolling average of samples, ${Number.isFinite(ceiling)&&ceiling>0?'shared':'sample'} speed scale zero to ${max} tokens per second; gaps collapsed to idle-coloured separators, horizontal positions are not wall-clock aligned"><line class="chart-grid" x1="0" y1="8" x2="300" y2="8"/><line class="chart-grid" x1="0" y1="30" x2="300" y2="30"/><line class="chart-baseline" x1="0" y1="52" x2="300" y2="52"/>${parts.join('')}</svg>`;
+}
+function hardwareMiniChart(series,value,ceiling,label,{now,gapMs=60000}={}){
+  const rows=(series??[]).map(sample=>({time:sample.time,value:value(sample)})).filter(sample=>Number.isFinite(sample.time)&&Number.isFinite(sample.value)).sort((a,b)=>a.time-b.time),max=Math.max(1,ceiling??0,...rows.map(row=>row.value));
+  const newest=now??rows.at(-1)?.time??Date.now(),from=newest-900000,point=row=>`${Math.max(0,(row.time-from)/900000*100).toFixed(1)},${(22-Math.min(1,row.value/max)*20).toFixed(1)}`;
+  const groups=[];for(const row of rows.filter(row=>row.time>=from&&row.time<=newest)){const current=groups.at(-1);if(!current||row.time-current.at(-1).time>gapMs)groups.push([row]);else current.push(row);}
+  return `<svg class="hardware-mini-chart" viewBox="0 0 100 24" preserveAspectRatio="none" role="img" aria-label="${esc(label)} over the last 15 minutes">${groups.map(group=>group.length===1?`<circle cx="${point(group[0]).split(',')[0]}" cy="${point(group[0]).split(',')[1]}" r="1.4"/>`:`<polyline points="${group.map(point).join(' ')}"/>`).join('')}</svg>`;
+}
+function temperatureMarkup(h,now){
+  const current=h.temperature_current,temps=current?.temperatures??[];
+  const reading=temps.find(row=>row.scope==='gpu')??temps.find(row=>row.scope==='cpu');
+  const stale=!h.temperature_at||now-h.temperature_at>120000||h.temperature_state!=='connected';
+  const label=reading?`${reading.scope==='cpu'?'CPU ':''}${fmtWhole(reading.celsius)}°C`:'°C —';
+  const flag=current?.thermal_throttling;
+  const detail=`${reading?`${reading.scope.toUpperCase()} sensor ${reading.sensor}, ${fmt(reading.celsius)} °C, sampled ${clock(reading.time)}.`:'No supported temperature sensor reading.'} ${stale?'Reading unavailable or stale.':''} Reported GPU thermal throttling: ${typeof flag==='boolean'?(flag?'active':'not active'):'unknown'}. Temperature alone does not establish throttling or dust buildup. Ambient temperature is unknown. Compare temperature, GPU activity and GPU clock at similar load before investigating cooling; CPU temperature is not a GPU temperature substitute.`;
+  const clockRows=(h.series??[]).filter(row=>Number.isFinite(row.time)&&row.time>=now-900000&&row.time<=now&&Number.isFinite(row.clock_mhz));
+  const clockCeiling=Math.max(1,...clockRows.map(row=>row.clock_mhz));
+  const clockPlot=clockRows.length?`<strong>GPU clock · 0–${fmtWhole(clockCeiling)} MHz</strong>${hardwareMiniChart(clockRows,row=>row.clock_mhz,clockCeiling,'GPU clock in MHz',{now})}`:'<strong>GPU clock · unavailable</strong><p>No GPU clock samples in this time window.</p>';
+  const plots=reading?`<div><strong>${esc(reading.scope.toUpperCase())} temperature · 0–150 °C</strong>${hardwareMiniChart(h.temperature_series,row=>row.temperatures?.find(t=>t.sensor===reading.sensor)?.celsius,150,'sensor temperature in Celsius',{now,gapMs:120000})}</div><div><strong>GPU activity · 0–100%</strong>${hardwareMiniChart(h.series,row=>row.accelerator_activity_pct,100,'GPU activity percent',{now})}</div><div>${clockPlot}</div><small>Shared wall-clock axis: ${clock(now-900000)} to ${clock(now)}. Each chart has its own labelled vertical scale. Gaps remain empty; no automatic correlation or cooling diagnosis is inferred.</small>`:'';
+  return `<button type="button" class="temperature-reading${stale?' stale':''}" data-light-chart="${esc(plots)}" data-light="temperature" data-light-title="Temperature evidence" data-light-detail="${esc(detail)}">${esc(label)}${reading?hardwareMiniChart((h.temperature_series??[]).filter(row=>row.time<=now),row=>row.temperatures?.find(t=>t.sensor===reading.sensor)?.celsius,150,`${reading.scope} temperature in Celsius, scale 0 to 150`,{now,gapMs:120000}):''}</button>`;
+}
+function hardwareMarkup(h,now){
+  if(!h?.configured)return '';
+  const current=h.current??{},stale=h.state==='stale'||!h.last_sample_at||now-h.last_sample_at>60000,series=h.series??[];
+  const memoryPct=Number.isFinite(current.memory_used_bytes)&&Number.isFinite(current.memory_total_bytes)&&current.memory_total_bytes>0?100*current.memory_used_bytes/current.memory_total_bytes:null;
+  const activity=current.accelerator_activity_pct,power=current.power_watts,clockMhz=current.clock_mhz;
+  const powerMax=Math.max(100,Math.ceil(Math.max(0,...series.map(sample=>sample.power_watts??0))/50)*50);
+  const status=({waiting:'waiting for first sample',connecting:'connecting',disconnected:String(h.reason??'adapter unavailable').replaceAll('_',' '),stale:'sample stale',connected:`sample ${age(h.last_sample_at,now)}`})[stale?'stale':h.state]??'unavailable';
+  const item=(kind,label,display,chart,secondary,detail)=>`<div class="hardware-reading ${kind}${stale?' stale':''}" title="${esc(`${detail} · ${status}`)}"><span>${label}</span><strong>${display}</strong>${chart}<small>${secondary}</small></div>`;
+  return `<div class="hardware-strip" aria-label="Read-only hardware telemetry; ${esc(status)}">${item('memory','RAM',Number.isFinite(memoryPct)?fmtWhole(memoryPct)+'%':'—',hardwareMiniChart(series,s=>Number.isFinite(s.memory_used_bytes)&&Number.isFinite(s.memory_total_bytes)&&s.memory_total_bytes>0?100*s.memory_used_bytes/s.memory_total_bytes:null,100,'host memory used'),current.memory_scope==='host_unified'?'unified host':'host',current.memory_scope==='host_unified'?'Unified host memory used; not dedicated GPU RAM':'Host memory used')}${item('accelerator','GPU',Number.isFinite(activity)?fmtWhole(activity)+'%':'—',hardwareMiniChart(series,s=>s.accelerator_activity_pct,100,'accelerator activity'),`${Number.isFinite(clockMhz)?`${fmtWhole(clockMhz)} MHz${current.clock_scope==='sm'?' SM':''}`:'clock —'} ${temperatureMarkup(h,now)}`,current.accelerator_scope==='gpu_kernel_time'?'Share of the sample period with GPU kernels executing':'Accelerator activity')}${item('power','POWER',Number.isFinite(power)?fmtWhole(power)+' W':'—',hardwareMiniChart(series,s=>s.power_watts,powerMax,'measured power draw'),current.power_scope==='compute_module'?'compute module':current.power_scope==='system'?'whole system':current.power_scope==='gpu_only'?'GPU only':'scope —',current.power_scope==='compute_module'?'Measured compute-module power used for energy integration':current.power_scope==='system'?'Measured whole-system power used for energy integration':current.power_scope==='gpu_only'?'Measured GPU power only; excluded from whole-machine energy estimates':'Power unavailable; no TDP estimate is substituted')}</div>`;
+}
+function telemetryStatus(d) {
+  if (d.telemetry_configured === false) return 'Engine timings not configured';
+  return `${d.telemetry_source === 'file' ? 'Model log' : 'Journal'} ${d.connected ? 'connected' : 'disconnected'}`;
+}
+let requestHistoryState=null,requestHistoryLoading=false,genieState=null;
+const fleetSpeedWindows=new Set(['1h','12h','24h']);let fleetSpeedWindow='12h';
+try{const saved=globalThis.localStorage?.getItem('dsg-fleet-speed-window-v1');if(fleetSpeedWindows.has(saved))fleetSpeedWindow=saved;}catch{/* Browser privacy settings may deny storage; 12h remains the safe default. */}
+function compactValue(n){return !Number.isFinite(n)?'—':n>=1000000?fmt(n/1000000)+'M':n>=1000?fmt(n/1000)+'k':fmtWhole(n);}
+function renderFleetSpeed(a){
+  const speed=a?.fleet_speed,ready=speed?.status==='ready'&&speed?.schema===1,window=ready?speed.windows?.[fleetSpeedWindow]:null;
+  if($('fleet-speed-window').value!==fleetSpeedWindow)$('fleet-speed-window').value=fleetSpeedWindow;
+  const setGauge=kind=>{
+    const phase=window?.[kind],value=phase?.mean_tps,max=speed?.calibration?.[kind]?.max_tps??(value===0?1:null),valid=Number.isFinite(value)&&Number.isFinite(max)&&max>0;
+    const gauge=$(`fleet-speed-${kind}`),fill=valid?Math.min(100,100*value/max):0,activity=Number.isFinite(phase?.activity_lower_bound_pct)?Math.min(100,phase.activity_lower_bound_pct):0;
+    gauge.classList.toggle('has-speed',valid&&value>0);gauge.classList.toggle('has-activity',activity>0);gauge.style.setProperty('--speed-fill',String(fill));gauge.style.setProperty('--activity-fill',String(activity));$(`fleet-${kind}-speed`).textContent=valid?fmtWhole(value):'—';
+    const label=valid?`${kind} observed mean ${fmtWhole(value)} tokens per second over ${fleetSpeedWindow}; gauge calibrated zero to ${fmtWhole(max)}; ${Number.isFinite(phase.activity_lower_bound_pct)?'at least '+fmt(activity)+' percent of fleet-hours observed in this phase':'phase occupancy unavailable'}; ${fmt(phase.samples)} timing intervals across ${fmt(phase.observed_workers)} workers`:`${kind} speed unavailable for ${fleetSpeedWindow}`;
+    gauge.setAttribute('aria-label',label);
+  };
+  setGauge('decode');setGauge('prefill');
+  const energy=window?.energy,estimated=energy?.estimated_kwh;
+  const observed=new Set([...(window?.decode?.workers??[]),...(window?.prefill?.workers??[])]).size,total=window?.decode?.worker_count??0;
+  const coverage=observed?`${observed}/${total} servers`:'Awaiting samples';
+  const energyText=Number.isFinite(estimated)?`≈${fmt(estimated)} kWh`:energy?.measured_kwh>0?`${energy.measured_kwh.toFixed(3)} kWh*`:'Energy unavailable';
+  $('fleet-speed-value').textContent=ready?`${coverage} · ${energyText}`:'Loading history…';
+  const state=({catching_up:'Loading saved measurements.',rescanning:'Rebuilding saved measurements.',waiting:'No saved measurements yet.',unavailable:'Measurement history unavailable.'})[speed?.status]||'Measurement history unavailable.';
+  const partial=!!(speed?.partial_history||speed?.malformed_lines||speed?.rejected_records||speed?.evicted_intervals);
+  const detail=ready?`Observed average speed over ${fleetSpeedWindow}, not combined fleet throughput. vLLM uses total tokens divided by total phase seconds for requests completed within the window; cached prefill tokens are excluded. Native engines use token/time deltas. oMLX uses time-weighted samples of reported active rates; its prefill and decode rate scopes differ from vLLM. Missing history is excluded, not treated as zero. Server counts indicate evidence present, not full-period coverage. Gauge ceilings use the padded 24-hour 95th percentile. Endpoint history starts when this collector was enabled; it is not reconstructed from lifetime averages. ${partial?'Some evidence is incomplete.':''}`:state;
+  const energyButton=$('fleet-speed-value');
+  energyButton.dataset.lightTitle=`Fleet history · ${fleetSpeedWindow}`;
+  energyButton.dataset.lightDetail=energy?`${detail}\n\nDecode: ${window?.decode?.observed_workers??0}/${total} servers. Prefill: ${window?.prefill?.observed_workers??0}/${total} servers.\n* kWh is the measured subtotal when coverage is incomplete.\n\nPeriod ${new Date(energy.window_start).toLocaleString()} to ${new Date(energy.window_end).toLocaleString()}. Measured subtotal ${(energy.measured_kwh??0).toFixed(4)} kWh; fleet estimate ${Number.isFinite(estimated)?estimated.toFixed(4)+' kWh':'unavailable'}. Adjacent power readings are integrated trapezoidally; gaps over 60 seconds are excluded. Each worker needs at least 80% coverage and one measurement scope for extrapolation. System and compute-module measurements have different boundaries; this is not utility-meter energy. GPU-only readings are excluded.\n\n${(energy.workers??[]).map(row=>`${row.worker}: ${row.measured_kwh.toFixed(4)} kWh measured, ${fmt(row.coverage_pct)}% coverage; ${row.scopes.join(', ')||'no eligible scope'}${row.sensors.length?' ('+row.sensors.join(', ')+')':''}; ${row.status.replaceAll('_',' ')}.`).join('\n')}`:state;
+  $('fleet-speed-summary').title=detail;$('fleet-speed-summary').setAttribute?.('aria-label',ready?`Fleet historical speed over ${fleetSpeedWindow}. Decode ${fmtWhole(window?.decode?.mean_tps)} tokens per second. Prefill ${fmtWhole(window?.prefill?.mean_tps)} tokens per second. ${Number.isFinite(estimated)?`Estimated energy ${fmt(estimated)} kilowatt hours.`:Number.isFinite(energy?.measured_kwh)&&energy.measured_kwh>0?`Measured energy subtotal ${energy.measured_kwh.toFixed(3)} kilowatt hours. Fleet estimate unavailable.`:'Energy unavailable.'}`:state);
+}
+async function loadRequestHistory() {
+  if(requestHistoryLoading)return;requestHistoryLoading=true;
+  try{const response=await fetch('/api/request-history');if(!response.ok)throw new Error();requestHistoryState=await response.json();}
+  catch{requestHistoryState={...requestHistoryState,status:'unavailable'};}
+  finally{requestHistoryLoading=false;renderFleetSpeed(requestHistoryState);renderGenieActionLedger();}
+}
+function cacheCostText(result) {
+  const part=p=>p?.estimated_ms===null||p?.estimated_ms===undefined?
+    (p?.status==='insufficient_evidence'?`unknown (${fmt(p.samples)}/3 required matching samples)`:'unknown (not measured)'):
+    `${fmt(p.estimated_ms/1000)} s (${fmt(p.samples)} samples${p.status==='no_cache_payload'?', no payload to load':Number.isFinite(p.observed_min_ms)?`, observed ${fmt(p.observed_min_ms/1000)}–${fmt(p.observed_max_ms/1000)} s`:''})`;
+  return `Disk payload load: ${part(result.disk_load)}. Prefill: ${part(result.prefill)}. These are component estimates, not total acquisition or completion time. Prefix search, later engine synchronization and remote transfer are unmeasured. Cache existence is not verified; observed ranges are not confidence intervals.`;
+}
+function cacheEvidenceText(snapshot,stale=false) {
+  if(stale)return 'Cache evidence health unavailable; no prior value is treated as current.';
+  const devices=snapshot?.devices||[],configured=devices.filter(d=>d.telemetry_configured).length;
+  const epochs=devices.filter(d=>d.telemetry_configured&&typeof d.backend_epoch==='string').length,a=snapshot?.attribution,counts=a?.counts;
+  if(!a||!counts)return `${fmt(epochs)} / ${fmt(configured)} telemetry-enabled servers have an observed process epoch · request attribution unavailable.`;
+  const quality=a.quality;
+  if(quality?.schema===1&&Number.isFinite(quality.resolved_starts)&&Number.isFinite(quality.counts?.corroborated)){
+    const gaps=Object.entries(quality.reason_counts||{}).slice(0,3).map(([reason,n])=>`${fmt(n)} ${reason.replaceAll('_',' ')}`).join(' · ');
+    const rate=Number.isFinite(quality.corroboration_rate_pct)?`${fmt(quality.corroboration_rate_pct)}%`:'unknown';
+    return `${fmt(epochs)} / ${fmt(configured)} telemetry-enabled servers have an observed process epoch · attribution yield: ${fmt(quality.counts.corroborated)} / ${fmt(quality.resolved_starts)} resolved starts corroborated (${rate}), ${fmt(quality.pending_starts)} pending, ${fmt(quality.counts.abstained)} abstained${gaps?` (${gaps})`:''}. Corroborated remains bounded shadow evidence, not protocol proof or a cache-hit verdict.`;
+  }
+  const reasons={};for(const row of a.recent||[])if(row.status==='abstained')reasons[row.reason]=(reasons[row.reason]||0)+1;
+  const gaps=Object.entries(reasons).sort((a,b)=>b[1]-a[1]).slice(0,3).map(([reason,n])=>`${fmt(n)} ${reason.replaceAll('_',' ')}`).join(' · ');
+  return `${fmt(epochs)} / ${fmt(configured)} telemetry-enabled servers have an observed process epoch · recent engine starts: ${fmt(counts.corroborated)} corroborated, ${fmt(counts.candidate)} pending candidates, ${fmt(counts.abstained)} abstained${gaps?` (${gaps})`:''}. Corroborated is still a bounded candidate, not protocol proof or a cache-hit verdict.`;
+}
+function relocationReason(row) {
+  const worker=row.conflicting_worker?` on ${row.conflicting_worker}`:'';
+  return ({gateway_stopping:'gateway is stopping',gateway_draining:'gateway is draining',source_not_active:'source became idle and should dispatch normally',cancelled_queue_head:'a cancelled queue head is still settling',already_dispatched:'request has already reached the model server',same_session_active:`the same session is still active${worker}`,same_session_queued:`the same session has earlier queued work${worker}`,same_session_waiting:'the same session has an earlier recovery wait',no_idle_destination:'no other model server is immediately free',durable_home_mismatch:'durable session ownership changed',offer_ready:'an exact handover offer is ready'})[row.reason]||`blocked by ${row.reason}`;
+}
+function relocationEmpty(diagnostics) {
+  const rows=diagnostics?.sources??[];
+  if(!rows.length)return 'No continuity-safe queued handover is currently available.';
+  return `No safe handover right now — ${rows.slice(0,4).map(row=>`${row.source}: ${relocationReason(row)}`).join(' · ')}${rows.length>4?' · more queued work omitted':''}.`;
+}
+function compactWait(seconds) {
+  if(!Number.isFinite(seconds)||seconds<0)return null;
+  if(seconds<120)return `${Math.ceil(seconds)}s`;
+  return `${Math.ceil(seconds/60)}m`;
+}
+function schedulingExplanation(g,workers,capacity) {
+  if(!g||!capacity?.free||!g.queued)return '';
+  const continuity=g.continuity,diagnostics=continuity?.relocation?.diagnostics,rows=diagnostics?.sources??[];
+  const row=rows.find(item=>item.destination&&item.reason==='offer_ready')??rows[0];
+  const idle=(diagnostics?.idle_destinations??[])[0]??workers.find(w=>w.is_healthy&&!w.drained&&!w.quarantine&&!w.load&&!w.queued)?.id;
+  if(!row)return ` ${idle||'A server'} is free, but this snapshot has no safe-handover explanation; inspect Manage model servers.`;
+  const route=idle?`${idle} is free; `:'';
+  if(row.automatic_reason==='automatic_wait_threshold'){
+    const threshold=continuity.automatic_affinity_rebalance_min_wait_ms,remaining=Number.isFinite(threshold)?threshold/1000-row.waiting_seconds:null,wait=compactWait(remaining);
+    return ` ${route}${row.source}'s next queued session keeps its warm home${wait?` for up to ${wait} more`:''}; then the Star Gate core may hand it over automatically.`;
+  }
+  if(row.automatic_reason==='affinity_automatic_disabled')return ` ${route}strict affinity keeps ${row.source}'s queued session at home until an exact manual or Genie handover.`;
+  if(row.automatic_reason==='automatic_ready')return ` ${route}${row.source}'s queued request is eligible for automatic core handover now.`;
+  return ` ${route}${row.source}'s queue cannot move yet: ${relocationReason(row)}.`;
+}
+function timeline(d,now,lanes=1) {
+  const rows=d.activity||[],start=now-900000,height=10*lanes;
+  const band=phase=>phase==='mixed'?'mixed':phase==='prefill'?'prefill':phase==='thinking'||phase==='decode'?'decode':['idle','paused'].includes(phase)?'idle-off':'unknown';
+  // Tensor-parallel pairs draw one strip with a mid divider: both machines run
+  // the same phases together, so one strip plus the "×2" scope chip is honest
+  // about pair coverage without pretending to be per-machine measurements.
+  const laneContent=lane=>rows.map(r=>{
+    const left=Math.max(start,r.start),right=Math.min(now,r.end),width=Math.max(0,(right-left)/9000),x=Math.max(0,(left-start)/9000);
+    if(width<=0)return '';
+    if(r.phase==='mixed')return `<rect class="phase-prefill" x="${x}" width="${width}" y="${lane*10}" height="5"><title>Prefill and generation observed together</title></rect><rect class="phase-decode" x="${x}" width="${width}" y="${lane*10+5}" height="5"><title>Prefill and generation observed together</title></rect>`;
+    return `<rect class="phase-${band(r.phase)}" x="${x}" width="${width}" y="${lane*10}" height="10"><title>${esc(r.phase)} · ${Math.round((right-left)/1000)}s</title></rect>`;
+  }).join('');
+  return `<svg class="activity-timeline" viewBox="0 0 100 ${height}" preserveAspectRatio="none" role="img" aria-label="Observed activity over the last fifteen minutes: blue is prefill, green is decode or generation, grey is idle or off, and empty gaps mean the phase is unavailable${lanes>1?'; one strip covering the two-machine pair, which runs the same phases together':''}">${Array.from({length:lanes},(_,lane)=>laneContent(lane)).join('')}${lanes>1?`<line class="lane-divider" x1="0" x2="100" y1="10" y2="10"/>`:''}${(d.endpoint_metrics?.source==='vllm'?[]:d.activity_markers??[]).filter(row=>row.basis==='completed_request'&&Number.isFinite(row.time)&&row.time>=start&&row.time<=now&&row.phase==='prefill').map(row=>`<line class="prefill-evidence-marker" x1="${(row.time-start)/9000}" x2="${(row.time-start)/9000}" y1="0" y2="${height}"><title>${row.basis==='completed_request'?'Completed request included':'Poll interval included'} ${fmtWhole(row.tokens)} computed prefill tokens. Tick marks observation time; prefill duration is not known.</title></line>`).join('')}</svg>${d.endpoint_metrics?.source!=='vllm'&&d.activity_markers?.some(row=>row.basis==='completed_request')?`<span class="timeline-evidence-note" title="Blue ticks mark observed prefill; the duration is not known.">ticks = prefill seen</span>`:''}`;
+}
+function routingInfo(w,{stale=false,recovering=false}={}) {
+  if(stale||!w)return {level:'unknown',label:'STATUS UNKNOWN',detail:'Live gateway status is unavailable. Routing controls are disabled until it returns.',action:null};
+  const busy=!!w.load||w.queued>0,held=!!w.holds?.length,locked=!!w.maintenance_locks?.length;
+  const reasons=[];
+  if(w.quarantine)reasons.push(({repeated_inference_failures:'Star Gate isolated this server after repeated inference failures.',fatal_accelerator_error:'Star Gate isolated this server after a fatal accelerator error.',accelerator_checkpoint_failure:'Star Gate isolated this server after an accelerator checkpoint failure.'})[w.quarantine.reason]||'Star Gate isolated this server after a generation fault.');
+  if(w.operator_paused)reasons.push('An operator paused gateway routing.');
+  if(w.last_operator_action){const action=w.last_operator_action,source=action.control_channel.replaceAll('_',' ');reasons.push(`Last local operator control: ${action.action} via ${source} at ${new Date(action.time).toLocaleString()}. The source label identifies the client path, not a human identity.`);}
+  if(held)reasons.push(`Reserved by ${w.holds.map(h=>h.owner_id).join(', ')}. The owning agent must release its hold; Resume cannot override it.`);
+  if(locked)reasons.push(`Maintenance lock${w.maintenance_locks.length===1?'':'s'}: ${w.maintenance_locks.map(lock=>lock.name).join(', ')}. Release each exact lock in Settings; routing remains paused until a separate checked Resume.`);
+  if(recovering)reasons.push('Service recovery is in progress. Wait for its verification receipt.');
+  if(!w.is_healthy&&!w.quarantine&&!recovering&&reasons.length)reasons.push('The last readiness check was also unavailable; resuming will recheck it.');
+  const cause=w.quarantine?'quarantined':locked?'maintenance_lock':held?'reserved':recovering?'recovering':w.drained?'paused':!w.is_healthy?'unavailable':null;
+  const excluded=w.drained||!!w.quarantine||!w.is_healthy||recovering;
+  const label=w.quarantine?'QUARANTINED · NOT ROUTING':locked?'MAINTENANCE LOCK · NOT ROUTING':held?'RESERVED · NOT ROUTING':w.drained?(busy?'PAUSING · ADMITTED WORK FINISHING':'PAUSED · NOT ROUTING'):recovering?'RECOVERING · NOT ROUTING':!w.is_healthy?'UNAVAILABLE · NOT ROUTING':'ROUTING ENABLED';
+  if(!reasons.length)reasons.push(w.drained?'Gateway routing is paused.':!w.is_healthy?managementDetail(w):'New requests may use this server. Pause stops new admission; admitted requests finish.');
+  if(w.quarantine)reasons.push('Verify & readmit checks model/context and generates a small test response. It does not restart the model server; failed checks keep it isolated.');
+  return {level:w.quarantine||!w.is_healthy?'bad':excluded?'paused':'ok',cause,label,detail:reasons.join(' '),excluded,
+    action:excluded?'resume':'drain',button:w.quarantine?'Verify & readmit':excluded?'Resume routing':'Pause routing',
+    blocked:held||locked||recovering||!!w.quarantine&&busy,
+    title:locked?'Release the exact named maintenance lock in Settings first; review times never auto-release it.':held?'Release agent holds first.':recovering?'Wait for service recovery.':w.quarantine&&busy?'Wait for admitted work to settle before verification.':excluded?'Check readiness and return to routing. Does not start or restart the model server.':'Stop new gateway admission. Existing admitted work, model process and caches stay intact; the model listener remains running.'};
+}
+function workerModelName(s,id){const records=s?.server_records?.records;if(!Array.isArray(records))return null;const record=records.find(r=>r.worker_id===id);return record?.observed?.model?.name||record?.candidate?.model?.name||null;}
+function modelFamily(name){const text=String(name||'').toLowerCase();if(text.includes('qwen'))return 'Qwen';if(text.includes('deepseek'))return 'DeepSeek';return null;}
+function familyGroups(s,workers){const groups=new Map();for(const w of workers){const family=modelFamily(workerModelName(s,w.id))||'Other';if(!groups.has(family))groups.set(family,[]);groups.get(family).push(w.id);}return [...groups].map(([family,ids])=>`${family} — ${ids.join(', ')}`).join(' · ');}
+function buildRoutingSummary(s,g,workers,stale){
+  if(stale)return {hidden:false,level:'warning',text:'Routing status is stale. Controls are disabled until live status returns.'};
+  if(!workers.length)return {hidden:true,level:'info',text:''};
+  const info=workers.map(w=>({w,r:routingInfo(w)}));
+  const routing=info.filter(x=>!x.r.excluded).map(x=>x.w);
+  const paused=info.filter(x=>x.r.cause==='paused').map(x=>x.w);
+  const unavailable=info.filter(x=>x.r.cause==='unavailable').map(x=>x.w);
+  const quarantined=info.filter(x=>x.r.cause==='quarantined').map(x=>x.w);
+  const held=info.filter(x=>['maintenance_lock','reserved','recovering'].includes(x.r.cause)).map(x=>x.w);
+  const excluded=[...paused,...unavailable,...quarantined,...held];
+  if(!excluded.length&&!g?.draining)return {hidden:true,level:'info',text:''};
+  const poolModel=g?.model||'PoolModel';
+  const servingModels=[...new Set(routing.map(w=>w.served_model||workerModelName(s,w.id)).filter(Boolean))];
+  const lines=[],draining=g?.draining?'The gateway is draining: all new admission is stopped.':'';
+  if(routing.length){
+    lines.push(`● Pool live · ${routing.length} of ${workers.length} server${workers.length===1?'':'s'} routing${draining?' · '+draining:''}`);
+    lines.push(`${poolModel}${servingModels.length?' → '+servingModels.join(', '):''}`);
+    lines.push(`Serving: ${routing.map(w=>w.id).join(', ')}`);
+  }else{
+    lines.push(`● No server can accept requests${draining?' · '+draining:''}`);
+    lines.push(`All ${workers.length} server${workers.length===1?'':'s'} are paused or unavailable.`);
+  }
+  if(paused.length)lines.push(`Paused by an operator: ${familyGroups(s,paused)}`);
+  if(unavailable.length)lines.push(`Unavailable: ${unavailable.map(w=>w.id).join(', ')}`);
+  if(quarantined.length)lines.push(`Quarantined: ${quarantined.map(w=>w.id).join(', ')}`);
+  if(held.length)lines.push(`Held or locked: ${held.map(w=>w.id).join(', ')}`);
+  if(!unavailable.length&&!quarantined.length)lines.push('No server is unhealthy.');
+  const routes=g?.model_routes;
+  if(routes&&typeof routes==='object'){
+    const routingIds=new Set(routing.map(w=>w.id));
+    const down=Object.entries(routes).filter(([,ids])=>Array.isArray(ids)&&!ids.some(id=>routingIds.has(id))).map(([name])=>name);
+    if(down.length)lines.push(`Routes with no live server: ${down.join(', ')}`);
+  }
+  lines.push('See each server card for its reason and routing control.');
+  const level=!routing.length?'error':(unavailable.length||quarantined.length)?'warning':'info';
+  return {hidden:false,level,text:lines.join('\n')};
+}
+function managementDetail(w) {
+  const probe={
+    ECONNREFUSED:'The last model readiness connection was refused at the configured endpoint. This does not identify whether the listener, tunnel forwarding or another network boundary caused it.',
+    ECONNRESET:'The last model readiness connection was reset. This observation alone does not prove that the model server crashed or establish the state of an inference request.',
+    PROBE_TIMEOUT:'The last model readiness probe exceeded its deadline; the cause is not established.',
+    model_or_context_mismatch:'The endpoint answered, but its model or context did not match the enrolled requirements.',
+    invalid_model_response:'The endpoint answered without a valid model-readiness response.'
+  }[w?.probe_error];
+  return managementPathDetail(w)+(probe?' '+probe:'');
+}
+function recoveryReasonDetail(reason) {
+  if(['adapter_local_interpreter_missing','adapter_local_identity_unverified','adapter_local_unavailable'].includes(reason))return managementPathDetail({management_path:{transport:'local',reason}});
+  return (reason||'checking').replaceAll('_',' ');
+}
+function managementPathDetail(w) {
+  const m=w?.management_path,reason=m?.reason;
+  const reasons={
+    adapter_local_interpreter_missing:'The Python interpreter configured for local recovery is missing. Repair its recovery binding; this does not mean the model server is down.',
+    adapter_local_identity_unverified:'The local recovery helper or its configuration could not be verified. Model readiness is checked separately.',
+    adapter_local_unavailable:'Local recovery is unavailable in the current platform or user context. Model readiness is checked separately.',
+    adapter_dns_failure:'The SSH management path cannot resolve its configured host alias.',
+    adapter_host_key_failure:'SSH rejected the configured host identity. Review the operator-owned known-host entry; Star Gate will not bypass host-key checking.',
+    adapter_auth_failure:'SSH authentication failed for the configured management path.',
+    adapter_connect_timeout:'The SSH management path timed out before a verified connection.',
+    adapter_connection_refused:'The configured machine refused the SSH connection.',
+    adapter_route_unreachable:'The configured machine has no reachable network route from this host.',
+    adapter_connection_reset:'The SSH connection was reset or closed remotely.',
+    adapter_spawn_failed:'The local SSH client could not be started.',
+    adapter_timeout:'The verified recovery inspection exceeded its bounded deadline.',
+    adapter_output_limit:'The recovery adapter exceeded its bounded output contract.',
+    adapter_unreachable:'The SSH management path exited before verification.',
+    adapter_check_failed:'The management path answered, but the enrolled recovery helper did not return a valid check.'};
+  const routes=Number.isSafeInteger(m?.route_count)&&m.route_count>1?` Star Gate is automatically cycling through ${m.route_count} enrolled SSH routes.`:'';
+  if(reasons[reason])return reasons[reason]+routes;
+  if(m?.transport==='ssh_tunnel'&&m.state==='ssh_process_active')return 'The local SSH tunnel process exists, but the model readiness probe is not succeeding; login, forwarding and service health are not yet distinguished.';
+  if(m?.transport==='ssh_tunnel'&&['connecting','retrying','ssh_error','pending'].includes(m.state))return 'The SSH tunnel is not verified; Star Gate is continuing its configured connection attempts.'+routes;
+  if(m?.transport==='local')return 'The local model endpoint is not passing its readiness check.';
+  return 'The server is not passing readiness checks. Check its model process or connection, then try again.';
+}
+function recoveryRecheckable(action){return !!(action?.restart_issued||action?.service_action_issued)&&['reconciliation_needed','failed'].includes(action.state);}
+function recoveryIssuanceText(op){return !op.service_action_issued?'':op.service_action==='bootstrap'?(op.bootstrap_acknowledged===true?' · bootstrap acknowledged':' · bootstrap attempted · acknowledgement unknown'):` · ${op.service_action} issued`;}
+function routingMarkup(w,{stale=false,controls=true,recovering=false,busy=workerBusy}={}) {
+  const info=routingInfo(w,{stale,recovering});
+  if(!controls||!info.action)return `<span class="worker-routing" data-level="${info.level}" aria-label="${esc(info.label)}"></span>`;
+  const name=String(w.id).replace(/^spark/i,'Spark '),at=w?.quarantine?.at;
+  const recorded=at&&Number.isFinite(Date.parse(at))?` Excluded ${new Date(at).toLocaleString()}; recorded by Star Gate.`:'';
+  const tooltip=`${info.label} for ${name}. ${info.detail}${recorded} ${info.title}`;
+  const icon=info.action==='drain'?'<path d="M5 4h4v16H5zM15 4h4v16h-4z"/>':'<path d="M6 4l14 8-14 8z"/>';
+  return `<span class="worker-routing" data-level="${info.level}"><button class="routing-toggle" type="button" data-action="${info.action}" data-id="${esc(w.id)}" data-tooltip="${esc(tooltip)}" aria-label="${esc(tooltip)}" ${stale||busy||info.blocked||!workerControlsReady?'disabled':''}><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">${icon}</svg></button></span>`;
+}
+function updateRoutingNode(current,fresh) {
+  // Keep the button DOM stable during normal polling so keyboard focus, hover
+  // tooltips and click targets do not disappear every two seconds.
+  current.dataset.level=fresh.dataset.level;
+  if(current.innerHTML!==fresh.innerHTML){const focused=current.contains(document.activeElement);current.innerHTML=fresh.innerHTML;if(focused)current.querySelector('button:not(:disabled)')?.focus({preventScroll:true});}
+}
+function renderCatalogue(s,now){
+  const container=$('fleet-catalogue');if(!container)return;
+  const {entries,warnings}=buildCatalogue({members:s.fleet_machines??[],workers:s.gateway?.workers??[],devices:s.devices??[],media:fleetWorkloadsUnavailable?{workloads:[],native_engines:[]}:fleetWorkloads,routes:s.gateway?.model_routes??{},now});
+  const serving=entries.some(e=>e.state==='serving-llm'||e.state==='serving-media');
+  const rows=entries.map(e=>`<tr data-state="${e.state}"><td title="${esc(e.detail)}">${esc(e.id)}</td><td>${esc(e.machines.length?e.machines.join(' + '):'—')}</td><td><span class="catalogue-state" data-state="${e.state}">${e.state.replace(/-/g,' ')}</span> <span class="catalogue-detail">${esc(e.detail)}</span></td><td>${esc(e.routes.length?e.routes.join(', '):'—')}</td><td>${e.observed_at?esc(new Date(e.observed_at).toLocaleTimeString()):'—'}</td></tr>`).join('');
+  container.innerHTML=`<details class="catalogue"${serving?' open':''}><summary>Fleet catalogue — model to machine mapping${warnings.length?` · ${warnings.length} note${warnings.length===1?'':'s'}`:''}</summary>${warnings.length?`<ul class="catalogue-warnings">${warnings.map(w=>`<li>${esc(w)}</li>`).join('')}</ul>`:''}<table class="catalogue-table"><thead><tr><th scope="col">Model</th><th scope="col">Machines</th><th scope="col">State</th><th scope="col">Routes</th><th scope="col">Observed</th></tr></thead><tbody>${rows}</tbody></table></details>`;
+}
+
+function renderDevices(devices,workers,now,stale,scales,controls) {
+  const viewport={x:window.scrollX,y:window.scrollY};
+  const container=$('devices'),existing=new Map([...container.querySelectorAll('.device')].map(el=>[el.dataset.workerId,el]));
+  if(!devices.length){container.innerHTML=`<article class="device onboarding"><h2>Add your first model server</h2><p>Register an already-running local endpoint or an endpoint reached through your existing SSH login. Star Gate checks model and context, then leaves routing paused until you enable it.</p>${controls?'<button type="button" class="button" data-add-first>Open server setup</button>':'<p class="muted">Enable local server controls in private Star Gate configuration to register from this dashboard.</p>'}</article>`;return;}
+  if(!existing.size)container.replaceChildren();
+  const existingOrder=new Map([...existing.keys()].map((id,index)=>[id,index]));
+  const serving=d=>{
+    const worker=workers.find(w=>w.id===d.id),media=workloadInfo(d.id,now);
+    const nativeBusy=!fleetWorkloadsUnavailable&&(fleetWorkloads.native_engines??[]).some(row=>row.worker_id===d.id&&row.state==='busy'&&Number.isFinite(row.observed_at)&&now>=row.observed_at&&now-row.observed_at<20000);
+    return Boolean(worker?.is_healthy&&!worker.drained&&!worker.quarantine||media&&!media.old&&!media.warning||nativeBusy);
+  };
+  const ordered=[...devices].sort((a,b)=>stale
+    ?(existingOrder.get(a.id)??devices.length)-(existingOrder.get(b.id)??devices.length)
+    :Number(serving(b))-Number(serving(a)));
+  ordered.forEach((d,i)=>{
+    const template=document.createElement('template');template.innerHTML=device(d,workers.find(w=>w.id===d.id),now,stale,i+1,scales,controls);
+    const fresh=template.content.firstElementChild;let current=existing.get(d.id);
+    if(!current)current=fresh;
+    else{
+      const focusedLight=current.contains(document.activeElement)?document.activeElement?.dataset?.light:null;
+      if(current.querySelector('.fleet-llm-history')?.open)fresh.querySelector('.fleet-llm-history')?.setAttribute('open','');
+      if(current.querySelector('.measurement-info')?.open)fresh.querySelector('.measurement-info')?.setAttribute('open','');
+      if(current.querySelector('.device-details')?.open)fresh.querySelector('.device-details')?.setAttribute('open','');
+      for(const selector of ['.device-identity','.device-live','.device-details>summary','.fleet-media']){const before=current.querySelector(selector),after=fresh.querySelector(selector);if(!before||!after)continue;if(before.innerHTML!==after.innerHTML)before.innerHTML=after.innerHTML;if(before.className!==after.className)before.className=after.className;for(const name of ['data-level','title','hidden']){const value=after.getAttribute(name);if(value===null)before.removeAttribute(name);else before.setAttribute(name,value);}}
+      // Keep the details drawer open state stable across refreshes.
+      if(current.querySelector('.device-details')?.open)fresh.querySelector('.device-details')?.setAttribute('open','');
+      if(focusedLight)current.querySelector(`[data-light="${focusedLight}"]`)?.focus({preventScroll:true});
+      updateRoutingNode(current.querySelector('.worker-routing'),fresh.querySelector('.worker-routing'));
+    }
+    if(container.children[i]!==current)container.insertBefore(current,container.children[i]||null);
+    existing.delete(d.id);
+  });
+  for(const el of existing.values())el.remove();
+  // WebKit can move the viewport when replacing its anchor inside a card.
+  // This synchronous refresh must not move the reader; no user input can occur
+  // between this snapshot and restoration. User-initiated tab scrolling is separate.
+  if(window.scrollX!==viewport.x||window.scrollY!==viewport.y)window.scrollTo(viewport.x,viewport.y);
+}
+function refreshRoutingControls() {
+  const turnsApply=$('conversation-turn-apply');if(turnsApply)turnsApply.disabled=workerBusy||!workerControlsReady||workerUiStale||turnsExpected===null;
+  // The fresh-install onboarding tile is not a worker and has no routing node.
+  for(const el of $('devices').querySelectorAll('.device[data-worker-id]')){
+    const w=visibleWorkers.find(w=>w.id===el.dataset.workerId),template=document.createElement('template');
+    template.innerHTML=routingMarkup(w,{stale:workerUiStale,controls:workerControlsVisible,recovering:recoveryState?.workers?.some(r=>r.worker_id===w?.id&&r.state==='recovering')});
+    updateRoutingNode(el.querySelector('.worker-routing'),template.content.firstElementChild);
+  }
+}
+function serverVerdict(d,w,now,stale=false) {
+  if(stale||!w)return {level:'unknown',label:'Status stale',detail:'Live gateway status is unavailable; values are historical.'};
+  if(w.quarantine)return {level:'bad',label:'Quarantined',detail:'Star Gate isolated this server after a generation fault. Use the recovery/readmission controls only after reviewing the evidence.'};
+  if(w.maintenance_locks?.length)return {level:'paused',label:'Maintenance',detail:`Named lock${w.maintenance_locks.length===1?'':'s'} ${w.maintenance_locks.map(lock=>lock.name).join(', ')} prevent all routing and automatic recovery. Review deadlines only warn; they never auto-release.`};
+  if(!w.is_healthy)return {level:'bad',label:'LLM unavailable',detail:managementDetail(w)};
+  if(w.drained)return {level:'paused',label:w.load?'Pausing':'Paused',detail:w.load?'No new work is admitted; an already admitted request is still finishing.':'No new gateway requests are admitted to this server.'};
+  const waiting=Number.isSafeInteger(w.queued)?w.queued:0,oldest=Number.isFinite(w.oldest_queue_seconds)?w.oldest_queue_seconds:null;
+  if(waiting>0)return {level:waiting>=3||oldest>=60?'warn':'busy',label:`Backed up · ${fmt(waiting)} waiting`,detail:`${fmt(waiting)} request${waiting===1?' is':'s are'} queued${oldest===null?'':`; oldest has waited ${fmt(oldest)} seconds`}.`};
+  if(w.load)return {level:'busy',label:'Serving',detail:'One request is active and no request is waiting behind it.'};
+  if(d?.backend==='openai'||d?.endpoint_metrics){
+    const engine=d.endpoint_metrics,at=engine?.activity_at??engine?.at;
+    const known=engine?.connected&&Number.isFinite(at)&&now>=at&&now-at<15000&&engine.live_activity!==false&&engine.phase==='idle'&&engine.running===0;
+    return known?{level:'ok',label:'Ready · idle',detail:'The endpoint reports no active engine requests; gateway routing is enabled.'}:{level:'unknown',label:'Ready · engine activity unknown',detail:'Gateway routing is ready. Current engine activity is not established, including work from direct clients.'};
+  }
+  const eventAge=Number.isFinite(d?.last_event)?now-d.last_event:null;
+  if(d?.telemetry_configured!==false&&(!d?.connected||eventAge>5*60000))return {level:'unknown',label:'Ready · telemetry stale',detail:'Routing is ready, but recent engine timing data is unavailable.'};
+  return {level:'ok',label:'Ready · idle',detail:'Healthy, enabled and immediately free for a gateway request.'};
+}
+function cacheLight(d,now,stale) {
+  const view=d.cache_continuity,worker=view?.status==='ready'&&Number.isFinite(view.checked_at)&&now-view.checked_at>=0&&now-view.checked_at<=15000?view.workers?.[d.id]:null;
+  if(d.backend==='openai'||d.endpoint_metrics){
+    const low=worker&&Number.isFinite(worker.last_low_reuse_at)&&now>=worker.last_low_reuse_at&&now-worker.last_low_reuse_at<=30*60000;
+    return {level:low?'amber':'grey',details:`OpenAI cache evidence comes from completed Star Gate request usage, independently of engine activity. ${fmt(worker?.assessed_pairs)} consecutive request pairs assessed in retained audit history; ${fmt(worker?.reuse_observed)} with substantial reuse and ${fmt(worker?.partial_reuse)} with partial reuse. Checked ${age(view?.checked_at,now)}; latest assessed pair ${age(worker?.last_assessed_at,now)}. ${low?'Recent low reuse needs review.':'No current cache-health verdict is established.'} Direct-client requests are outside this evidence. Exact prefix equality, disk restore time and fault causality are unavailable.`};
+  }
+  const recent=(d.recent??[]).filter(row=>row.kind==='start'&&/^[a-f0-9]{64}$/.test(d.backend_epoch??'')&&row.backend_epoch===d.backend_epoch&&now-row.time>=0&&now-row.time<=30*60000);
+  const hits=recent.filter(row=>row.cached>0).length;
+  const fresh=!stale&&d.connected&&Number.isFinite(d.last_event)&&now-d.last_event>=0&&now-d.last_event<=15000;
+  const low=worker&&Number.isFinite(worker.last_low_reuse_at)&&now-worker.last_low_reuse_at>=0&&now-worker.last_low_reuse_at<=30*60000;
+  const level=!fresh?'grey':low?'amber':hits>=3?'green':'grey';
+  const reason=low?'Recent low reuse needs review':hits>=3?'Repeated reuse observed':'Not enough recent reuse evidence';
+  const spans=(d.cache_cost?.samples??[]).filter(row=>row.kind==='disk_load'&&Number.isFinite(row.ms)&&row.ms>=0&&now-row.time>=0&&now-row.time<=3600000);
+  const load=spans.length?`${fmt(spans.reduce((sum,row)=>sum+row.ms,0)/1000)}s in ${spans.length} measured disk-load spans in the last hour.`:'Disk-load time unavailable.';
+  const details=`${reason}. ${hits} starts reused a prefix among ${recent.length} retained starts in the last 30 minutes; at most 30 non-chunk engine events are retained. ${fmt(worker?.assessed_pairs)} consecutive request pairs assessed; checked ${age(view?.checked_at,now)}. ${fmt(worker?.high_suspicion_low_reuse)} stronger-suspicion and ${fmt(worker?.unconfirmed_low_reuse)} unconfirmed low-reuse pairs in retained audit history. ${load} Extra time caused by lost reuse: unknown. These counts do not prove a cache defect. A cold start or successful disk restore is not itself a problem. Confidence: bounded engine reuse observations; exact prefix equality and fault causality are unavailable. Next: ${low?'Check history edits, compaction, process changes and prefix evidence for the affected turn.':'Inspect a pair of completed same-session turns if reuse was expected but not observed.'} ${!fresh?'Live telemetry is stale or unavailable.':''}`;
+  return {level,details};
+}
+function performanceLightDetail(value,kind,history,now) {
+  const labels={matched_comparison:'Matched comparison',insufficient_matched_history:'Insufficient matched history',awaiting_sustained_confirmation:'Awaiting sustained confirmation',peer_configuration_unverified:'Equivalent peer configuration is unverified',history_reader_unavailable:'History reader unavailable',idle:'Idle',stale_or_unavailable:'Stale or unavailable'};
+  const summary=comparison=>!comparison?'Unknown':comparison.level==='grey'?labels[comparison.reason]??'Unknown':`${fmtWhole(comparison.recent?.tps)} vs ${fmtWhole(comparison.baseline_tps)} t/s; ${fmt(Math.max(0,comparison.slowdown)*100)}% slower, ${fmt(comparison.recent?.requests)} recent requests, ${fmtWhole(comparison.recent?.seconds)} active seconds, ${fmt(comparison.matched_fraction*100)}% matched`;
+  const basis=value?.configuration_basis==='operator_attested_profile'?'Matching operator-attested hardware, model, quantization, build and serial concurrency. Attestation is not live verification.':'Same backend process only; cross-restart build/configuration and equivalent hardware peers are unverified. No overlapping prompt starts are admitted to the comparison.';
+  return [
+    `${labels[value?.reason]??'Awaiting history'} · last 30 minutes. Self: ${summary(value?.self)}. Peers: ${summary(value?.peers)}. Verdict basis: ${(value?.basis??'none').replaceAll('_',' ')}. Measurement ${age(value?.as_of,now)}.`,
+    kind==='decode'?'Accounting: generated-token deltas / active decode seconds, including thinking. Prefill, queue and idle are excluded. Context uses power-of-two token bands.':'Accounting: new-token deltas / active prefill seconds. Cold, cached suffix and restored suffix work are separate. Context and suffix use power-of-two token bands; disk-load time is excluded.',
+    `Confidence: limited by workload bands and observed coverage. ${basis} Baseline: up to seven days, excluding recent work; oldest matching sample ${age(value?.history_from,now)}.`,
+    `At least three requests and 60 active seconds per matched cohort; 80% of recent time must match. Slowdowns need two disjoint ten-minute blocks, each with two requests and 20 active seconds. Thresholds: ${fmt((history?.thresholds?.amber??.15)*100)}% amber / ${fmt((history?.thresholds?.red??.30)*100)}% red.`,
+    history?.partial_history||history?.skipped_intervals?`Evidence exclusions: ${Object.entries(history?.exclusion_reasons??{}).map(([key,n])=>`${key.replaceAll('_',' ')} (${fmt(n)})`).join('; ')||'reader gaps or history limits'}.`:null,
+    'Next: check workload/context, concurrency, build changes and hardware telemetry before attributing a slowdown to a server fault.'
+  ].filter(Boolean).join('\n\n');
+}
+function performanceLightsMarkup(d,now,stale) {
+  const history=d.performance_history,worker=history?.workers?.[d.id];
+  const levels={green:'Normal',amber:'Review',red:'Slow',grey:'Unknown'};
+  return `<div class="performance-lights" aria-label="Observed performance">${['decode','prefill','cache'].map(kind=>{
+    const title=kind==='cache'?'Cache hits':kind==='decode'?'Decode':'Prefill';
+    const value=kind==='cache'?cacheLight(d,now,stale):worker?.[kind];
+    const endpoint=d.backend==='openai'||d.endpoint_metrics;
+    const level=endpoint?(kind==='cache'?value.level:'grey'):stale?'grey':Object.hasOwn(levels,value?.level)?value.level:'grey';
+    const detail=kind==='cache'?value.details:endpoint?'Matched performance comparisons are not available for this OpenAI backend. Live engine rates and engine-session averages are shown above; they do not establish a slowdown against equivalent workloads. Historical engine-log comparisons do not apply to this endpoint.':performanceLightDetail(value,kind,history,now);
+    const label=kind==='cache'&&level==='green'?'Reuse':levels[level];
+    return `<button type="button" class="performance-light" data-light="${kind}" data-level="${level}" data-light-title="${title}" data-light-detail="${esc(detail)}" title="${esc(detail)}" aria-label="${title}: ${label}. Open evidence"><span class="light-dot" aria-hidden="true"></span><span>${title}</span><small>${label}</small></button>`;
+  }).join('')}</div>`;
+}
+
+function rollingRateNote(value){
+  const known=Number.isFinite(value?.mean_tps),trend=['up','down','steady'].includes(value?.trend)?value.trend:'insufficient';
+  const direction={up:'↑',down:'↓',steady:'→',insufficient:''}[trend];
+  const span=Number.isFinite(value?.history_span_ms)?Math.min(6,value.history_span_ms/3600000):0;
+  const comparison=Number.isFinite(value?.change_pct)?`${value.change_pct>=0?'+':''}${value.change_pct.toFixed(1)}%: latest 3h versus preceding 3h (${fmtWhole(value.recent_mean_tps)} versus ${fmtWhole(value.previous_mean_tps)} t/s).`:'Trend needs at least 3 timing intervals and 60 active seconds in each 3h half, with complete readable history.';
+  const detail=known?`Rolling 6h: total observed tokens / active processing seconds; idle time excluded. ${value.samples} timing intervals, ${Math.round(value.active_seconds)} active seconds. Available measurement span: ${span.toFixed(2)}h of 6h${value.partial_history?'; partial history':''}. ${comparison} Changes under 5% are steady. Workload and context length affect observed speed.`:`Rolling 6h average unavailable (${value?.status??'awaiting history'}).`;
+  return `<span class="rolling-rate" tabindex="0" title="${esc(detail)}">6h avg ${known?fmtWhole(value.mean_tps):'—'} t/s${direction?` <span class="rate-trend ${trend}" aria-label="${trend==='up'?'faster':trend==='down'?'slower':'steady'}">${direction}</span>`:''}</span>`;
+}
+
+let fleetWorkloads={observed_at:null,workloads:[]},fleetWorkloadsUnavailable=false;
+function workloadInfo(id,now) {
+  const rows=(fleetWorkloads.workloads??[]).filter(row=>row.worker_id===id);
+  if(!rows.length)return null;
+  const job=rows[0],old=fleetWorkloadsUnavailable||!Number.isFinite(fleetWorkloads.observed_at)||now-fleetWorkloads.observed_at>15000;
+  const labels={starting:'Preparing',waiting_idle:'Waiting for LLM work to finish',starting_media:'Loading media engine',transferring_inputs:'Transferring reference files',generating:job.state==='queued'?'Queued in media engine':'Generating',observing_media:'Checking native job status',retaining_results:'Saving generated files',waiting_media_idle:'Waiting for other media work',restoring_llm:'Loading original LLM',checking_llm:'Verifying LLM and cache',needs_attention:'LLM return needs attention',observation_failed:'Operation status unavailable',launch_uncertain:'Runner launch unconfirmed'};
+  const warning=old||rows.length>1||!labels[job.phase]||['needs_attention','observation_failed','launch_uncertain','observing_media'].includes(job.phase)||job.state==='uncertain';
+  return {...job,old,warning,engine:job.kind==='video'?'MiniMax H3':job.kind==='music'?'ACE-Step':'Media',label:old?'Last known media operation':rows.length>1?'Conflicting operation records':job.state==='uncertain'?'Native submission unconfirmed':labels[job.phase]??'Operation status unknown'};
+}
+function nativeMediaProgressMarkup(job,now) {
+  const p=job.native_progress;
+  if(!p||!Number.isFinite(p.at))return '<p class="muted">Waiting for native step progress. No completion estimate is available.</p>';
+  const ageMs=now-p.at,live=!job.old&&p.connected&&ageMs>=0&&ageMs<30000;
+  const measured=Number.isSafeInteger(p.value)&&Number.isSafeInteger(p.max)&&p.max>0&&p.value>=0&&p.value<=p.max;
+  const sampler=['KSampler','KSamplerAdvanced'].includes(p.node_type),label=sampler?'Sampling steps':'Node progress';
+  const nodeLabel=sampler?'Sampling':({VAEDecode:'Decoding video',VAEDecodeAudio:'Decoding audio',UNETLoader:'Loading video model',CLIPLoader:'Loading text/vision model'})[p.node_type]??p.node_type??(p.node?'Node '+p.node:'Between nodes');
+  return `<div class="fleet-native-progress"><strong title="${esc(p.node_type??'')}">${esc(nodeLabel)}${measured?' · '+fmt(p.value)+' / '+fmt(p.max)+(sampler?' steps':''):''}</strong>${measured?`<progress value="${p.value}" max="${p.max}" aria-label="${label}: ${p.value} of ${p.max}"></progress>`:''}<p>${live?'Latest native update':'Last observed native update'} · ${age(p.at,now)}${!p.connected?' · progress connection unavailable':''}. Current node only; this is not whole-job completion.</p></div>`;
+}
+function workloadMarkup(job,w,now) {
+  const elapsed=value=>{const t=Date.parse(value);return Number.isFinite(t)&&t<=now?`${Math.floor((now-t)/60000)}m ${Math.floor((now-t)%60000/1000)}s`:'Unknown';};
+  const heartbeat=Date.parse(job.heartbeat_at),fresh=!job.old&&Number.isFinite(heartbeat)&&now>=heartbeat&&now-heartbeat<30000;
+  const llm=job.phase==='waiting_idle'?'Finishing existing LLM work before switching.':job.phase==='checking_llm'?'Checking real responses and cache reuse before readmission.':job.phase==='restoring_llm'?'Original LLM is loading; return is not yet verified.':job.phase==='needs_attention'?'Return failed or needs attention. Inspect the operation.':'Original LLM will be restored and checked after media work.';
+  return `<section class="fleet-media" aria-label="${esc(job.engine)} workload"><div class="fleet-media-heading"><strong>${esc(job.engine)}</strong><span>${esc(job.label)}</span></div><div class="fleet-media-facts"><div><span class="label">OPERATION ELAPSED</span><strong>${elapsed(job.started_at)}</strong></div><div><span class="label">CURRENT STAGE</span><strong>${elapsed(job.changed_at)}</strong></div><div><span class="label">BATCH</span><strong>${job.batch_size>1?`${fmt(job.batch_index)} / ${fmt(job.batch_size)}`:'Single job'}</strong></div></div><p class="fleet-media-job">Job <code>${esc(job.job_id)}</code> · ${esc(job.state)}${job.outputs_state?' · outputs '+esc(job.outputs_state):''}</p><p class="fleet-media-heartbeat" data-level="${fresh?'good':'warning'}">${fresh?'Runner heartbeat received':'Runner heartbeat unavailable or old'}${Number.isFinite(heartbeat)?' · '+age(heartbeat,now):''}. This is a runner check-in, not measured generation progress.</p>${['generating','observing_media'].includes(job.phase)?job.kind==='video'?nativeMediaProgressMarkup(job,now):'<p class="muted">Generation steps and completion time are not reported by this engine connection.</p>':''}<p class="fleet-media-return"><strong>Return to LLM:</strong> ${job.old?'Status is out of date; return is not confirmed.':esc(llm)}${w?.quarantine?' LLM is quarantined.':''}</p><a href="#media" data-media-engine="${job.kind==='video'?'h3':'ace-step'}">View ${job.kind==='video'?'video':'music'} jobs, results and errors →</a></section>`;
+}
+function nativeMediaMarkup(id,now){
+  return (fleetWorkloads.native_engines??[]).filter(row=>row.worker_id===id).map(row=>{
+    const fresh=!fleetWorkloadsUnavailable&&Number.isFinite(row.observed_at)&&now>=row.observed_at&&now-row.observed_at<20000;
+    if(!fresh)return '';
+    const state=row.state,name=row.engine==='comfyui'?'H3 / ComfyUI':row.engine==='ace-step'?'ACE-Step':'Media';
+    const detail=state==='busy'?`${row.running_count} running · ${row.waiting_count} waiting`:'Native queue empty';
+    return `<section class="fleet-media"><strong>${esc(name)} · ${esc(state)}</strong><p>${esc(detail)} · ${age(row.observed_at,now)}</p>${state==='busy'&&row.running?`<p>Native jobs: ${[...row.running,...row.waiting].map(esc).join(', ')}</p>`:''}<p class="muted">Includes direct clients. Queue status is not whole-job progress or whole-machine idleness.</p></section>`;
+  }).join('');
+}
+function device(d, w, now, stale, index = 1, scales={}, controls=false) {
+  const workload=workloadInfo(d.id,now);
+  const nativeActive=!stale&&!fleetWorkloadsUnavailable&&(fleetWorkloads.native_engines??[]).some(row=>row.worker_id===d.id&&row.state==='busy'&&Number.isFinite(row.observed_at)&&now>=row.observed_at&&now-row.observed_at<20000);
+  if(workload&&stale){workload.old=true;workload.warning=true;workload.label='Last known media operation';}
+  const engineBusy=!stale&&d.endpoint_metrics?.connected&&now-d.endpoint_metrics.at>=0&&now-d.endpoint_metrics.at<15000&&d.endpoint_metrics.running>0;
+  const state = engineBusy&&['prefill','decode','mixed'].includes(d.endpoint_metrics.phase)?d.endpoint_metrics.phase:!w?.load&&engineBusy?'engine busy':phase(d,w,now,stale);
+  const bad = workload?stale||workload.warning:stale || !w?.is_healthy;
+  const verdict=workload?{level:workload.warning||stale?'unknown':'busy',label:workload.label,detail:'Star Gate media operation; LLM availability is shown separately.'}:nativeActive?{level:'busy',label:'Native media work',detail:'The enrolled media engine reports running or queued jobs, including direct clients.'}:!w?.load&&engineBusy?{level:'busy',label:'Engine reports activity',detail:'The endpoint reports active work, but Star Gate has no dispatched request on this worker. Direct clients and engine cleanup are outside Star Gate request accounting.'}:serverVerdict(d,w,now,stale);
+  const metric = (kind, title) => {
+    const endpoint=d.endpoint_metrics??(d.backend==='openai'?{}:null);
+    if(endpoint){
+      const live=!stale&&endpoint.connected&&Number.isFinite(endpoint.at)&&now-endpoint.at>=0&&now-endpoint.at<15000;
+      const liveRate=live?endpoint['live_'+kind+'_tps']:null;
+      const hasLive=Number.isFinite(liveRate)&&endpoint.running>0&&(endpoint.phase==='mixed'||endpoint.phase===kind||(kind==='decode'&&endpoint.phase==='thinking'));
+      const rate=kind==='prefill'?endpoint.prefill_tps:hasLive?liveRate:endpoint[kind+'_tps'];
+      const showLive=hasLive&&kind!=='prefill';
+      const label=!live?'Historical · '+age(endpoint.at,now):showLive?'Live':kind==='prefill'&&endpoint.source==='omlx'?'Average · incl. overhead':'Session average';
+      const chunk=kind==='prefill'&&hasLive?`<span class="metric-live-chunk">${fmtWhole(liveRate)} live</span>`:'';
+      return `<div class="metric-block ${live?'':'metric-stale'}"><span class="label">${title}</span><div class="rate ${kind}">${fmtWhole(rate)}<em>t/s</em></div><div class="metric-scope"><span>${label}</span>${chunk}</div>${chart(endpoint.series,kind,now)}<div class="chart-caption">15m · 20s avg · ${kind==='prefill'?(endpoint.source==='omlx'?'chunk speed':'completed-request prefill speed'):'live rates'}</div></div>`;
+    }
+
+    const noSamples=endpoint?!Number.isFinite(endpoint[kind+'_tps'])&&!(endpoint.series??[]).some(s=>s.kind===kind):!Number.isFinite(d[kind]?.tps)&&!(d.series??[]).some(s=>s.kind===kind);
+    if(noSamples)return `<div class="metric-block metric-stale"><span class="label">${title}</span><p class="muted">No engine measurements yet.</p></div>`;
+    const m = d[kind];
+    const staleMetric=stale||!Number.isFinite(m?.time)||now-m.time>60000;
+    const explanation=kind==='decode'?'Generation speed reported by the engine, including thinking and answer tokens.':'Prompt-processing speed reported by the engine.';
+    const measured=`${staleMetric?'Last':'Latest'} measurement: ${age(m?.time,now)}. Values are engine observations, not a promise of current speed.`;
+    return `<div class="metric-block ${staleMetric?'metric-stale':''}"><span class="label" title="${explanation}">${title}</span><div class="rate ${kind}">${fmtWhole(m?.tps)}<em>t/s</em></div><div class="metric-note" title="${esc(measured)}">${rollingRateNote(d.rolling_rates?.[kind])} · ${age(m?.time, now)}</div>${chart(d.series, kind, now,scales[kind])}<div class="chart-caption" title="${esc(scales.detail)} Exact ceiling: ${scales[kind]} t/s. Gaps compressed; not a shared wall-clock axis.">15m · 20s avg · 0–${fmtWhole(scales[kind])} t/s</div></div>`;
+  };
+  const gatewayActivity=(!stale&&w)?`<span class="request-chip" title="Gateway requests active / configured slots${Number.isSafeInteger(w.queued)&&w.queued>0?`; ${fmt(w.queued)} queued in Star Gate`:''}${d.backend==='openai'&&!d.endpoint_metrics?.connected?' · native speed metrics unavailable':''}">${fmt(w.load??0)}/${fmt(w.max_concurrent_requests??1)}${Number.isSafeInteger(w.queued)&&w.queued>0?` · ${fmt(w.queued)}q`:''}</span>`:'';
+  const endpoint=d.endpoint_metrics;
+  const metricsFresh=!stale&&endpoint?.connected&&Number.isFinite(endpoint.at)&&now>=endpoint.at&&now-endpoint.at<15000;
+  const metricsInfo=endpoint?`<div class="server-metrics-status"><span>${metricsFresh?'Updated':'Unavailable'} · ${age(endpoint.at,now)}</span><details class="measurement-info"><summary>Metric details</summary><div><p>${esc(endpoint.source??'Endpoint')} · ${fmt(endpoint.running)} active · ${fmt(endpoint.waiting)} waiting · ${fmt(endpoint.requests)} completed</p><p>${endpoint.source==='omlx'?'Prefill is an engine-session average: newly processed tokens divided by time to first token, including setup, waiting and cache work. It is not pure compute speed. Live prefill and its chart show latest-chunk speed.':'Prefill chart points use newly computed KV tokens divided by engine-reported prefill seconds for requests completed since the last sample. Cached tokens are excluded. Blue runs from scheduling to the first generated token; green follows generation. Phases are sampled every 2 seconds; a single completed request refines the blue duration from engine timings, with about one poll of placement uncertainty. Decode rates use token changes over polling intervals.'}</p><p>Decode includes thinking and answer tokens. Chart lines use a trailing 20-second average of samples. Raw measurements and headline speeds are unchanged. Charts cover 15 minutes with gaps compressed; missing samples do not prove idle.</p></div></details></div>`:'';
+  const duration=!stale&&w?.load&&Number.isFinite(w.active_seconds)&&Math.floor(w.active_seconds/60)>0?`<span class="remaining-estimate" title="Elapsed time of the active Star Gate request; not an estimate">${fmtWhole(Math.floor(w.active_seconds/60))}m active</span>`:'';
+  const activityDuration=workload?`<span class="remaining-estimate">${esc(workload.engine)}</span>`:duration;
+  const phaseRedundant=!!workload||['unavailable','paused'].includes(state)||nativeActive;
+  const llmReadings=`${thinkingIndicator(w,stale,now)}<div class="metrics">${metric('decode','DECODE')}${metric('prefill','PREFILL')}</div>${metricsInfo}`;
+  const offlineReadings=`<p class="muted">No LLM telemetry is available for this server right now${w?.is_healthy===false?' because Star Gate cannot reach its endpoint':''}. Hardware agents, media engines and power scripts are shown independently of LLM state.</p>`;
+  const performance=performanceLightsMarkup(d,now,stale||!!workload||nativeActive||!(d.performance_history?.workers?.[d.id]?.active??w?.load));
+  const unavailableLlm=!stale&&w&&!w.is_healthy&&!workload;
+  const historicalLlm=unavailableLlm||nativeActive;
+  const mediaWarning=fleetWorkloadsUnavailable?'<p class="fleet-media-warning">Media status unavailable; this machine’s workload cannot currently be confirmed.</p>':'';
+  // Compact face: status dot + name + state word, one live line, conditional chips.
+  const dotLevel={ok:'ok',busy:'busy',warn:'warn',bad:'bad',paused:'paused',unknown:'unknown'}[verdict.level]??'unknown';
+  const thinkingLevel=(()=>{const info=thinkingInfo(w?.load?w.requested_thinking:w?.last_requested_thinking);return info.label&&info.label!=='—'?info.label.toLowerCase():null;})();
+  const stateWord=!stale&&w?.quarantine?'quarantined':w?.direct_reserved===true?'direct use':state==='mixed'?'prefill + generation':state==='decode'?(d.endpoint_metrics?'gen':'answering'):state==='thinking'?`thinking${thinkingLevel?` · ${thinkingLevel}`:''}`:state;
+  const liveRates=(()=>{
+    const e=d.endpoint_metrics;
+    if(e){
+      const live=!stale&&e.connected&&Number.isFinite(e.at)&&now-e.at>=0&&now-e.at<15000;
+      const dLive=live?e.live_decode_tps:null,dHas=Number.isFinite(dLive)&&e.running>0&&(e.phase==='mixed'||e.phase==='decode'||e.phase==='thinking');
+      const decode=dHas?dLive:e.decode_tps,prefill=e.prefill_tps;
+      const parts=[];
+      if(Number.isFinite(decode)&&decode>0)parts.push(`<span class="rate-inline decode" title="Generation speed${dHas?' (live)':' (session average)'}; includes thinking tokens">↓${fmtWhole(decode)} t/s</span>`);
+      if(Number.isFinite(prefill)&&prefill>0)parts.push(`<span class="rate-inline prefill" title="Prompt-processing speed (${e.source==='omlx'?'engine-session average incl. overhead':'completed-request prefill'})">↑${fmtWhole(prefill)} t/s</span>`);
+      return parts.join(' ');
+    }
+    const parts=[];
+    for(const kind of ['decode','prefill']){const m=d[kind];if(Number.isFinite(m?.tps)&&m.tps>0&&!((stale||!Number.isFinite(m.time))||now-m.time>60000))parts.push(`<span class="rate-inline ${kind}" title="${kind==='decode'?'Generation':'Prompt-processing'} speed reported by the engine">${kind==='decode'?'↓':'↑'}${fmtWhole(m.tps)} t/s</span>`);}
+    return parts.join(' ');
+  })();
+  const cacheUsage=(()=>{
+    const u=d.cache_continuity?.usage,wu=u?.workers?.[d.id];
+    if(!wu||!wu.requests)return '';
+    const value=Number.isFinite(wu.recent_cached_fraction)?wu.recent_cached_fraction:wu.cached_fraction;
+    const scope=Number.isFinite(wu.recent_cached_fraction)?`last ${fmt(wu.recent_requests)} request${wu.recent_requests===1?'':'s'}`:`${fmt(wu.requests)} requests`;
+    const pair=d.cache_continuity?.workers?.[d.id];
+    const caveat=pair?` Pair audit: ${fmt(pair.assessed_pairs)} consecutive pairs assessed${Number.isFinite(pair.last_assessed_at)?`, latest ${age(pair.last_assessed_at,now)}`:''}.`:' No consecutive-pair verdict established.';
+    const title=`Share of prompt tokens returned as cached across completed Star Gate request usage (prompt-token-weighted, ${scope}). A first/cold turn is a natural miss; this is not a cache-health verdict.${caveat} Exact prefix equality and fault causality are unavailable.`;
+    const low=pair&&Number.isFinite(pair.last_low_reuse_at)&&now-pair.last_low_reuse_at>=0&&now-pair.last_low_reuse_at<=30*60000;
+    return `<span class="cache-chip${low?' warn':''}" title="${esc(title)}">⌀${value===null?'—':Math.round(value*100)+'%'} cache</span>`;
+  })();
+  const chips=thinkingIndicator(w,stale,now);
+  const liveLine=`<div class="device-live"><span class="state-word" data-level="${dotLevel}">${esc(stateWord)}</span>${gatewayActivity}${liveRates}${cacheUsage}${mediaWarning?'<span class="cache-chip warn">media?</span>':''}</div>`;
+  // Face-level utilization strip: always-visible phase bar (split per machine for
+  // tensor-parallel pairs) plus small decode/prefill rate charts without captions.
+  const machines=/sparks\d/i.test(d.id)?2:1;
+  const machineNote=machines>1?' Both machines of this tensor-parallel pair run the same phases together; one strip shows pair scope, not separate measurements.':'';
+  const bar=`<div class="device-bar" data-lanes="1"><div class="bar-label">ACTIVITY · 15m</div>${timeline(d,now,1)}<span class="bar-note${machines>1?' pair':''}" title="Blue is prefill, green is decode or generation, grey is idle or off, empty gaps mean the phase is unavailable.${esc(machineNote)}">${machines>1?'×2':'×1'}</span></div>`;
+  const miniChart=kind=>{
+    const e=d.endpoint_metrics;
+    const svg=e?chart(e.series,kind,now):chart(d.series,kind,now,scales[kind]);
+    const rate=e?(kind==='decode'?e.decode_tps:e.prefill_tps):d[kind]?.tps;
+    const staleNote=e?'':(stale||!Number.isFinite(d[kind]?.time)||now-d[kind]?.time>60000?' · stale':'');
+    return `<div class="mini-chart-block" title="${kind==='decode'?'Decode':'Prefill'} · last 15 minutes, 20-second rolling average${Number.isFinite(rate)?` · session average ${fmtWhole(rate)} t/s`:''}${staleNote}. Full block with methodology in Details."><span class="mini-label ${kind}">${kind==='decode'?'DEC':'PRE'}</span>${svg}</div>`;
+  };
+  const miniCharts=`<div class="device-minicharts">${miniChart('decode')}${miniChart('prefill')}</div>`;
+  const detailBody=`<div class="metrics">${metric('decode','DECODE')}${metric('prefill','PREFILL')}</div>${metricsInfo}${hardwareMarkup(d.hardware,now)}${performance}`;
+  const detailOpen=!!workload;
+  const details=`<details class="device-details"${detailOpen?' open':''}><summary>Details</summary>${workload?workloadMarkup(workload,w,now):''}${unavailableLlm?offlineReadings:''}${historicalLlm&&!unavailableLlm?llmReadings:detailOpen?llmReadings:detailBody}</details>`;
+  const powerInfo=controls&&fleetPower?.enabled?fleetPower.members?.find(m=>m.worker_id===d.id):null;
+  const latestReceipt=fleetPower?.recent?.find(r=>r.worker===d.id);
+  const powerLabel=state=>({ready:'ready ✓',stopped:'stopped ✓',timeout:'timeout — unproven',failed:'failed ✗'}[state]??'');
+  const powerLine=fleetPowerBusy.has(d.id)?'working…':latestReceipt?`${latestReceipt.action} · ${latestReceipt.verified&&latestReceipt.verified.state!=='unverified'?powerLabel(latestReceipt.verified.state):latestReceipt.ok?'ok':`exit ${latestReceipt.exit_code?? '?'}`} · ${new Date(latestReceipt.finished_at).toLocaleTimeString()}`:powerInfo?.busy?'working…':'';
+  const offline=!workload&&!nativeActive&&(!endpoint||endpoint.connected!==true);
+  const compactBar=offline?'':bar,compactCharts=offline?'':miniCharts;
+  const powerTitles={status:'Run the enrolled status script for this model.',start:'Start this model through its enrolled script. Readiness is verified against the endpoint before reporting Started.',stop:'Stop this model through its enrolled script. Refuses when gateway or direct work is active, when a same-hardware model still holds work, or when this is the last healthy LLM. Stopping a Spark pair stops both machines of that pair.'};
+  const powerStrip=powerInfo?`<div class="device-power">${['status','start','stop'].map(a=>`<button type="button" class="power-button" data-power-action="${a}" data-power-worker="${esc(d.id)}"${fleetPowerBusy.has(d.id)||powerInfo.busy?' disabled':''} title="${esc(powerTitles[a])}">${{status:'Status',start:'Start',stop:'Stop'}[a]}</button>`).join('')}<span class="power-status" title="${esc(latestReceipt?.output??'')}">${esc(powerLine)}</span></div>`:'';
+  return `<article class="device ${workload?'is-media':nativeActive?'is-native':''}" data-worker-id="${esc(d.id)}"><div class="device-top"><div class="device-identity"><span class="device-dot" data-level="${dotLevel}" title="${esc(verdict.detail)}"></span><span class="device-name-text" title="${esc(verdict.label)} — ${esc(verdict.detail)}${w?.served_model?` · serving ${esc(w.served_model)}`:''}">${esc(d.id.replace(/^spark/, 'Spark '))}</span>${activityDuration}${routingMarkup(w,{stale,controls,recovering:recoveryState?.workers?.some(r=>r.worker_id===w?.id&&r.state==='recovering')})}</div></div>${liveLine}${compactBar}${compactCharts}${mediaWarning}${nativeMediaMarkup(d.id,now)}${offline?'':chips}${powerStrip}${details}</article>`;
+}
+const headlineSeverity=value=>['good','info','warning','critical'].includes(value)?value:'info';
+function deterministicHealthAlerts(snapshot) {
+  const gateway=snapshot?.gateway,workers=Array.isArray(gateway?.workers)?gateway.workers:[],recovery=Array.isArray(gateway?.recovery?.workers)?gateway.recovery.workers:[];
+  const recoveryByWorker=new Map(recovery.map(worker=>[worker.worker_id,worker]));
+  const alerts=[];
+  for(const row of snapshot.generation_alerts?.rows??[])alerts.push({severity:'warning',text:`${row.worker}: a request ended at ${clock(row.at)} with ${row.kind==='reasoning_only_final'?'reasoning but no answer or tool output':'no observed answer, reasoning or tool output'}. This describes captured output only; no automatic retry or routing change was made.`});
+  const fleet=`${fmt(gateway?.available)} of ${fmt(gateway?.total)} model servers are available`;
+  for(const run of gateway?.client_watch?.runs??[])if(run.fresh&&run.process_alive&&run.diagnosis==='no_request_reached_dsg')alerts.push({severity:'warning',text:`${run.client} run ${run.watch_ref} reports waiting for a model, but no matching request reached Star Gate after ${fmt(run.state_seconds)}s. Recommendation: Inspect that client's provider transport; no model-server fault or frozen process is proven.`});
+  for(const run of gateway?.client_watch?.runs??[])if(run.fresh&&run.process_alive&&run.diagnosis==='client_reported_error')alerts.push({severity:'warning',text:`${run.client} run ${run.watch_ref} reports a failed turn with no automatic continuation remaining. Recommendation: Inspect the client before resubmitting; this is not proof that replay is safe or that the model server failed.`});
+  for(const worker of workers) {
+    const name=String(worker?.id??'Unknown server').replace(/^spark/i,'Spark '),held=Array.isArray(worker?.holds)&&worker.holds.length>0;
+    if(worker?.quarantine) {
+      const waiting=Number.isSafeInteger(worker.recovery_waiting)&&worker.recovery_waiting>0?` ${fmt(worker.recovery_waiting)} request${worker.recovery_waiting===1?' is':'s are'} being held for this server.`:' ';
+      const recoveryState=recoveryByWorker.get(worker.id),reason=recoveryState?.reason;
+      const launchdAdvice={
+        launchd_registration_absent:'The Mac service registration is missing. Ask the operator to inspect the established launcher; kickstart cannot restore a removed job, and Star Gate has no bootstrap authority.',
+        launchd_gui_domain_unavailable:'The Mac GUI service domain is unavailable. Ask the operator to check the login/session state; this does not prove a model-server or accelerator fault.',
+        launchd_state_unverified:'Mac service inspection could not establish the state. Check local permissions and service-manager output before taking action; absence is not proven.',
+        launchd_native_disabled:'macOS explicitly disables this service. Respect that stop instruction; ask the operator before changing native service policy. Star Gate will not enable it.',
+        launchd_disable_state_unverified:'The Mac native disable setting could not be verified. Check the enrolled helper version and launchctl inspection; unknown policy is not permission to start.'
+      }[reason];
+      const recommendation=launchdAdvice??(reason==='service_identity_or_profile_unverified'
+        ?'Review and deliberately re-enroll the changed model service profile before recovery; simply enabling routing would bypass the safety boundary.'
+        :reason==='profile_handback_confirmation_pending'
+          ?'Leave the server idle while Star Gate confirms the same changed profile in a second inspection; no action has been authorized yet.'
+          :reason==='profile_handback_disabled'
+            ?'Review the changed profile, then enable verified profile hand-back or complete an operator-led enrollment.'
+            :reason==='profile_handback_wait_for_admitted_work'
+              ?'Wait for admitted work to finish; profile adoption and recovery cannot begin while a request is owned by this server.'
+        :recoveryState?.eligible
+          ?'Use the verified recovery control; Star Gate will restart only the enrolled service and test it before readmission.'
+          :'Inspect the recovery blocker before readmission; do not simply enable routing.');
+      alerts.push({severity:'critical',text:`${name} is quarantined after ${String(worker.quarantine.reason||'a generation fault').replaceAll('_',' ')}; ${fleet}.${waiting} Recommendation: ${recommendation}`});
+      continue;
+    }
+    const overdue=(worker?.maintenance_locks??[]).filter(lock=>Number.isFinite(lock.review_at)&&lock.review_at<=Date.now());
+    if(worker?.load>0&&Number.isFinite(worker.active_seconds)&&worker.active_seconds>=1800&&worker.queued>0){
+      const d=snapshot.devices?.find(device=>device.id===worker.id),decode=d?.decode,now=snapshot.time??Date.now();
+      const fresh=d?.connected&&Number.isFinite(decode?.time)&&now-decode.time>=0&&now-decode.time<=15000&&Number.isSafeInteger(decode.generated)&&decode.generated>=0;
+      const progress=fresh?` Latest engine sample: ${fmt(decode.generated)} generated tokens${decode.thinking?' (thinking phase)':''}; ${fmtWhole(decode.tps)} t/s.`:' Fresh engine generation progress is unavailable.';
+      alerts.push({severity:'warning',text:`${name}: one Star Gate request has held its slot for ${fmtWhole(Math.floor(worker.active_seconds/60))}m; ${fmt(worker.queued)} waiting.${progress} Recommendation: Review the long-running client request. Elapsed time alone does not prove a hang or authorize cancellation.`});
+    }
+    if(overdue.length)alerts.push({severity:'warning',text:`${name} remains protected by overdue maintenance lock${overdue.length===1?'':'s'} ${overdue.map(lock=>lock.name).join(', ')}. Recommendation: Confirm the external work is finished, then release the exact lock; Star Gate will keep routing paused until a separate checked Resume.`});
+    // Operator pauses, maintenance locks and scoped agent holds are intentional capacity choices,
+    // not faults. They stay explicit on the worker card without becoming alarms.
+    if(worker?.drained||held)continue;
+    if(worker?.is_healthy===false) {
+      const waiting=Number.isSafeInteger(worker.recovery_waiting)&&worker.recovery_waiting>0?worker.recovery_waiting:0;
+      alerts.push({severity:waiting>0?'critical':'warning',text:`${name} is enabled but unavailable; ${fleet}.${waiting?` ${fmt(waiting)} request${waiting===1?' is':'s are'} waiting for it.`:''} Recommendation: Inspect its readiness and verified management path before readmission.`});
+    }
+  }
+  return alerts;
+}
+function renderAgentWatch(watch){
+  const panel=$('agent-watch'),runs=watch?.runs??[];panel.hidden=!watch;
+  if(!watch)return;
+  const needsAttention=run=>run.fresh&&['no_request_reached_dsg','client_reported_error'].includes(run.diagnosis);
+  const fresh=runs.filter(run=>run.fresh).length,attention=runs.filter(needsAttention).length;
+  $('agent-watch-status').textContent=runs.length?`${fmt(runs.length)} enrolled · ${fmt(fresh)} fresh${attention?` · ${fmt(attention)} check`:''}`:'No enrolled clients reporting';
+  const labels={local_tool_active:'tool execution',waiting_inside_dsg:'waiting inside Star Gate',model_response_active:'model response active',no_request_reached_dsg:'no request reached Star Gate',waiting_to_reach_dsg:'waiting to reach Star Gate',client_processing_after_dsg:'client processing after Star Gate',client_reported_error:'client reports a failed turn',heartbeat_stale_unknown:'heartbeat stale · state unknown',idle:'no local tool reported',done:'done',unknown:'state unknown'};
+  $('agent-watch-items').innerHTML=runs.length?runs.slice(0,24).map(run=>`<li data-activity="${run.fresh&&run.process_alive&&run.state==='local_tool'&&run.diagnosis==='local_tool_active'?'tool':run.fresh&&run.process_alive&&run.state==='idle'?'idle':'unknown'}" data-level="${needsAttention(run)?'attention':run.fresh?'current':'unknown'}"><time>${esc(age(Date.parse(run.last_seen_at),Date.now()))}</time><strong>${esc(run.client)} · ${esc(run.watch_ref)}</strong><span>${esc(labels[run.diagnosis]??'state unknown')}${run.request?` · Star Gate ${esc(run.request.state.replaceAll('_',' '))}`:''}</span></li>`).join(''):'<li class="muted">No enrolled clients reporting.</li>';
+}
+function healthHeadlines(snapshot, ticker) {
+  if(!snapshot?.gateway || snapshot.gateway_error)return {level:'unknown',items:[{severity:'info',text:'Gateway status unavailable; recommendations withheld until fresh evidence returns.'}]};
+  const safety=deterministicHealthAlerts(snapshot),genie=ticker?.state==='ready'&&ticker.entries?.length?ticker.entries.map(e=>({severity:headlineSeverity(e.severity),text:`${e.text}${e.recommendation?` Recommendation: ${e.recommendation}`:''}`})):[];
+  if(safety.length||genie.length) {
+    const items=[...safety,...genie],prefix=safety.length?'Star Gate safety alert'+(genie.length?' + Genie assessment':' · observed gateway evidence'):'Genie assessment';
+    return {level:items.some(e=>e.severity==='critical')?'critical':items.some(e=>e.severity==='warning')?'warn':items.some(e=>e.severity==='good')?'ok':'info',evidence_at:ticker?.evidence_at,
+      label:`${prefix}${genie.length?` · evidence ${clock(ticker.evidence_at)}${ticker.refreshing?' · updating':ticker.review_error?' · latest refresh failed':''}`:''}`,items};
+  }
+  const updating=ticker?.refreshing && !['off','unavailable'].includes(ticker?.state);
+  const message={off:'Gate Genie is off. Enable him below for generated health observations.',
+    reviewing:'Gate Genie is reviewing fleet evidence. His observations and recommendations will appear here.',
+    pending:'Waiting for a Genie assessment from the selected server.',
+    stale:'The last assessment is over 10 minutes old or has no valid evidence time. Request a fresh review below.',
+    changed:'Fleet health or membership changed since the last assessment. Request a fresh review before acting on old advice.',
+    invalid:'Genie returned no valid ticker entries. Read his assessment below or request another review.',
+    error:Number.isInteger(ticker?.model_http_status)&&ticker.model_http_status>=400&&ticker.model_http_status<600
+      ?`Genie's model rejected the review (HTTP ${ticker.model_http_status}). Check the reviewer's model and request settings. Gateway status is still live.`
+      :ticker?.provider_attempts?.length>1
+      ?`The Genie review failed after both the dedicated provider and Star Gate pool fallback were tried (${ticker.provider_attempts.map(a=>`${String(a.provider).replaceAll('_',' ')}: ${String(a.reason||a.outcome).replaceAll('_',' ')}`).join('; ')}). The gateway is unaffected.`
+      :'Genie could not complete the latest review. Check his status below. Gateway status is still live.',
+    unavailable:'Genie status is unavailable. Waiting for a fresh assessment.'};
+  const g=snapshot.gateway,counts=[g.healthy,g.total,g.active,g.queued];
+  const observed=counts.every(n=>Number.isSafeInteger(n)&&n>=0)?`Fleet: ${g.healthy}/${g.total} servers healthy; ${g.active} running; ${g.queued} waiting. `:'';
+  return {level:'unknown',label:observed?'Live fleet status · Genie status':'Genie status',items:[{severity:'info',text:observed+(updating?'Genie is preparing a fresh assessment. The banner will update when it finishes.':message[ticker?.state] || 'Connecting to Gate Genie…')}]};
+}
+let wireSnapshot=null,wireSignature=null,wireState=null,requestFilter='all';
+function renderRequests(events) {
+  const recent=events.filter(e=>e.event==='request_finished').reverse();
+  const rows=recent.filter(e=>requestFilter==='problems'?!['complete','vision_guidance'].includes(e.outcome):requestFilter==='slow'?e.elapsed_ms>=300000||e.queue_ms>=60000:true).slice(0,12);
+  $('requests').innerHTML = rows.length ? rows.map(e => `<tr><td>${e.time ? clock(e.time) : '—'}</td><td>${esc(e.node)}</td><td class="${e.outcome === 'complete' ? 'success' : e.outcome === 'vision_guidance' ? 'protected' : e.outcome === 'client_cancelled' ? 'cancelled' : 'failure'}">${esc(e.outcome?.replaceAll('_',' ') || 'unknown')}</td><td>${fmt(e.elapsed_ms / 1000)}s</td><td>${fmt(e.queue_ms)}ms</td><td>${fmt(e.usage?.cached_tokens)} / ${fmt(e.usage?.prompt_tokens)}</td><td>${fmt(e.usage?.completion_tokens)}</td><td class="mono" title="${esc(e.request_id)}">${esc(e.request_id?.slice(0,8))}</td></tr>`).join('') : `<tr><td colspan="8" class="muted">No ${requestFilter==='all'?'request completions in the observed log tail':requestFilter} requests match the current filter.</td></tr>`;
+}
+function renderHealthWire(snapshot) {
+  wireSnapshot=snapshot;
+  const wire=$('health-wire');
+  if(wire.matches(':hover, :focus-within'))return;
+  const news=healthHeadlines(snapshot,wireState),signature=JSON.stringify(news);
+  if(signature===wireSignature)return;
+  wireSignature=signature;wire.dataset.level=news.level;
+  for(const id of ['health-wire-text','health-wire-copy']) {
+    const group=$(id);group.replaceChildren(...news.items.map(entry=>{
+      const item=document.createElement('span');item.className='health-wire-item';item.dataset.severity=headlineSeverity(entry.severity);
+      const label=document.createElement('span');label.className='health-wire-severity';label.textContent={good:'Good',info:'Info',warning:'Warning',critical:'Critical'}[item.dataset.severity]+': ';
+      const text=document.createElement('span');text.textContent=entry.text;item.append(label,text);return item;
+    }));
+  }
+  // Measure one complete group, including the deliberate gaps, at 52px/s.
+  // Polling preserves the animated track rather than restarting its animation.
+  $('health-wire-track').style.animationDuration=`${Math.max(12,$('health-wire-text').getBoundingClientRect().width/52)}s`;
+}
+function configurationRows(row){
+  const fields=[['Runtime','runtime.name'],['Runtime version','runtime.version'],['Build','runtime.build'],['Model','model.name'],['Quantization','model.quantization'],
+    ['Context tokens','settings.context_length'],['Maximum output tokens','settings.max_output_tokens'],['Server concurrency','settings.server_concurrency'],['Prefill batch tokens','settings.prefill_batch_tokens'],
+    ['KV cache precision','settings.kv_cache_dtype'],['Prefix caching','settings.prefix_caching'],['Speculative method','settings.speculative_decoding.method'],['Speculative tokens','settings.speculative_decoding.tokens'],
+    ['Thinking enabled','serving_contract.chat_template_defaults.enable_thinking'],['Thinking preserved','serving_contract.chat_template_defaults.preserve_thinking'],['Reasoning effort','serving_contract.chat_template_defaults.reasoning_effort'],
+    ['Suppress EOS during reasoning','serving_contract.reasoning.suppress_eos_in_reasoning'],['GPU memory fraction','serving_contract.gpu_memory_utilization'],
+    ['Temperature','serving_contract.generation_defaults.temperature'],['Top-p','serving_contract.generation_defaults.top_p'],['Top-k','serving_contract.generation_defaults.top_k'],
+    ['Min-p','serving_contract.generation_defaults.min_p'],['Repetition penalty','serving_contract.generation_defaults.repetition_penalty'],['Generation output default','serving_contract.generation_defaults.max_new_tokens']];
+  return fields.map(([label,key])=>({label,values:['observed','approved','proposed'].map(kind=>{const record=row[kind];if(!record)return {present:false,value:null};return {present:true,value:key.split('.').reduce((v,k)=>v?.[k],record)??null};})})).filter(r=>r.values.some(v=>v.value!==null));
+}
+function hourglassReportLines(row){
+  const s=row.summary,a=row.association,score=s.score;
+  const lines=[`Run: ${s.run_date?new Date(s.run_date).toLocaleString():'date unknown'} · Reported state: ${s.state}`,
+    `Metric: ${score.version??'unknown'} · Hourglass ${s.benchmark_version??'version unknown'} · Scoring: ${s.scoring_policy??'unknown'}`,
+    `Active seconds: ${s.active_seconds??'unknown'} / window ${s.window_seconds??'unknown'} · Clock adjustment: ${s.clock_adjustment_seconds??'unknown'}s`,
+    `Hardware: ${s.hardware.label??'unknown'} (${s.hardware.source??'source unknown'})`,
+    `Worker: ${a.worker_id??'not linked'} · Route: ${a.route} · Contention: ${a.contention} (operator supplied)`,
+    `Associated configuration revision: ${a.approved_configuration_revision??'not linked'} (operator supplied; not verified by the report)`,
+    `Bank fingerprint: ${s.bank_fingerprint??'unknown'} · Hourglass configuration key: ${s.configuration_key??'unknown'}`,
+    `Timing policy: ${s.timing_policy??'unknown'} · Question timeout policy: ${s.question_timeout_policy??'unknown'}`,
+    `Execution: timeout ${s.execution.question_timeout_s??'unknown'}s; repeats ${s.execution.repeat??'unknown'}; wrong-answer stop ${s.execution.stop_after_wrong??'unknown'}; rounds ${s.execution.round_policy??'unknown'}`,
+    `Report created: ${s.report_created_at?new Date(s.report_created_at).toLocaleString():'unknown'} · Report revision: ${row.report_revision??'unknown'}`];
+  if(s.repaired)lines.push('The report records a repaired run.');
+  for(const c of s.caveats)lines.push(`Caveat: ${c.label??'unlabelled'} · affected attempts ${c.attempts??'unknown'}`);
+  return {title:`${s.model} · ${score.value===null?'Score not reported':String(score.value)+' '+(score.unit??'reported score (unknown metric)')} · ${s.state}`,lines};
+}
+function renderHourglassReports(value){
+  const panel=$('hourglass-reports');if(!panel)return;panel.hidden=!value?.configured;
+  const items=$('hourglass-report-items');if(!value?.configured){items.replaceChildren();return;}
+  const signature=JSON.stringify(value);if(items.dataset.signature===signature)return;items.dataset.signature=signature;items.replaceChildren();
+  $('hourglass-report-status').textContent=`${value.reports.length} saved reports · ${value.unavailable.length} unavailable. Different metrics and conditions are not automatically comparable.`;
+  for(const row of value.reports){
+    const item=hourglassReportLines(row),entry=document.createElement('details'),heading=document.createElement('summary');
+    entry.style.overflowWrap='anywhere';entry.style.whiteSpace='normal';heading.textContent=item.title;entry.append(heading);
+    for(const line of item.lines){const p=document.createElement('p');p.textContent=line;entry.append(p);}items.append(entry);
+  }
+}
+function renderServerRecords(value){
+  const panel=$('server-records');if(!panel)return;panel.hidden=!value?.configured;
+  const items=$('server-record-items');if(!value?.configured){items.replaceChildren();return;}
+  const signature=JSON.stringify(value);if(items.dataset.signature===signature)return;items.dataset.signature=signature;items.replaceChildren();
+  for(const row of value.records??[]){
+    const entry=document.createElement('details'),heading=document.createElement('summary');heading.textContent=row.worker_id;entry.append(heading);
+    for(const kind of ['observed','approved','proposed']){
+      const record=row[kind],p=document.createElement('p');
+      if(!record){p.textContent=kind==='approved'?'No owner-approved configuration recorded.':kind==='observed'?'No inspection recorded.':'No proposed change recorded.';entry.append(p);continue;}
+      const settings=record.settings,parts=[record.runtime.name,record.runtime.version,record.model.name].filter(Boolean);
+      if(settings.context_length!==undefined)parts.push(`context ${settings.context_length?.toLocaleString()??'unknown'}`);
+      if(settings.server_concurrency!==undefined)parts.push(`server concurrency ${settings.server_concurrency??'unknown'}`);
+      p.textContent=`${kind[0].toUpperCase()+kind.slice(1)} · ${new Date(record.recorded_at).toLocaleString()} · ${parts.join(' · ')}`;entry.append(p);
+      const proof=document.createElement('p');proof.className='muted';proof.textContent=`Revision ${record.revision?.slice(0,12)??'unavailable'} · restore ${record.restoration.drill.status==='restored-in-drill'?'demonstrated in a recorded drill':'unproven'}`;entry.append(proof);
+      if(record.discrepancies.length){const warning=document.createElement('p');warning.textContent='Differences to review: '+record.discrepancies.map(v=>({configured_route_differs:'startup route differs from the saved live route',recovery_binding_differs:'recovery enrollment uses a different route',launcher_differs:'launcher differs from the inspected process',source_has_local_changes:'runtime source has local modifications',runtime_settings_unverified:'some running settings remain unverified'})[v]).join('; ');entry.append(warning);}
+    }
+    const comparison=document.createElement('details'),label=document.createElement('summary');label.textContent='Compare recorded settings';comparison.append(label);
+    const scope=document.createElement('p');scope.className='muted';scope.textContent='Recorded values only. Unknown is not a default, and a proposed value is not approval to apply it.';comparison.append(scope);
+    const table=document.createElement('table'),head=document.createElement('thead'),header=document.createElement('tr');table.style.width='100%';table.style.tableLayout='fixed';
+    for(const title of ['Setting','Observed','Approved','Proposed']){const th=document.createElement('th');th.style.whiteSpace='normal';th.textContent=title;header.append(th);}head.append(header);table.append(head);
+    const body=document.createElement('tbody');for(const r of configurationRows(row)){const tr=document.createElement('tr'),name=document.createElement('th');name.scope='row';name.style.whiteSpace='normal';name.textContent=r.label;tr.append(name);for(const cell of r.values){const td=document.createElement('td');td.style.overflowWrap='anywhere';td.style.whiteSpace='normal';td.textContent=!cell.present?'No record':cell.value===null?'Unknown':typeof cell.value==='boolean'?(cell.value?'On':'Off'):String(cell.value);tr.append(td);}body.append(tr);}table.append(body);const wrap=document.createElement('div');wrap.className='table-wrap';wrap.tabIndex=0;wrap.setAttribute('role','region');wrap.setAttribute('aria-label',`Configuration comparison for ${row.worker_id}`);wrap.append(table);comparison.append(wrap);entry.append(comparison);
+    items.append(entry);
+  }
+  if(value.unavailable?.length){const p=document.createElement('p');p.textContent='Some configuration records could not be read. Existing files were preserved.';items.append(p);}
+}
+function render(s) {
+  renderServerRecords(s.server_records);
+  renderHourglassReports(s.hourglass_reports);
+  const g = s.gateway, now = s.time, stale = !!s.gateway_error;
+  renderHealthWire(s);
+  renderAgentWatch(g?.client_watch);
+  const rejected=g?.continuity?.recent_rejections??[];
+  $('patient-wait-status').hidden=stale||!g?.continuity?.waiting;
+  $('patient-wait-status').textContent=`Star Gate is holding ${fmt(g?.continuity?.waiting)} undispatched requests for recovery/readiness · oldest wait ${fmt(g?.continuity?.oldest_wait_seconds)}s · ${Object.entries(g?.continuity?.waiting_reasons??{}).map(([reason,n])=>`${fmt(n)} ${reason.replaceAll('_',' ')}`).join(' · ')}. They resume automatically when eligible; pauses remain respected.`;
+  $('continuity-status').textContent=stale?'Historical evidence: gateway unavailable.':!g?.continuity?'This gateway version does not expose continuity receipts.':`${rejected.length} recent rejected attempts in this gateway run. Not dispatched means no inference started for that attempt, not that the client resumed. Long waits are not proof of a stall.`;
+  $('continuity-rejections').innerHTML=rejected.slice(0,8).map(r=>`<p><time>${esc(clock(r.time))}</time> · ${esc(r.node||'pool')} · ${esc(r.reason?.replaceAll('_',' '))} · ${r.retry_class==='wait_then_retry'?'compatible client may wait/retry':'operator investigation required'} · <code title="${esc(r.request_id)}">${esc(r.request_id?.slice(0,8))}</code></p>`).join('');
+  $('connection').textContent = s.demo ? '◉ Demo telemetry' : stale ? 'Status unavailable' : '● Live telemetry';
+  $('warning').hidden = !s.gateway_error && !s.telemetry_error;
+  $('warning').textContent = [s.gateway_error,s.telemetry_error].filter(Boolean).join(' · ');
+  $('model').textContent = s.demo ? `${g?.model || 'Model gateway'} · illustrative data · no real model servers connected` : `${g?.model || 'Model gateway'} · ${g?.workers?.some(w=>(w.max_concurrent_requests??1)>1)?'configured concurrent request capacity':'one active gateway request per model server'} · session-affinity routing`;
+  const door=s.continuity_door,waiting=knownWaiting(g,door);
+  $('available').textContent = g ? `${g.available} / ${g.total}` : '—'; $('active').textContent = fmt(g?.active); $('queued').textContent = g?fmt(waiting.total):'—';
+  $('queued').title=door?.holding?`${fmt(waiting.core)} admitted in the gateway core + ${fmt(waiting.held)} held safely at the Continuity Door. Pi/Hermes work not yet sent to Star Gate is not visible here.`:'Requests known to Star Gate and not yet dispatched. Pi/Hermes work not yet sent to Star Gate is not visible here.';
+  const cap=capacity(g,stale),scales=rateScales(s.devices,s.rate_peaks,now);
+  $('capacity-value').textContent=cap?.percent!=null?`${cap.percent}% occupied`:'Unknown';
+  $('capacity-note').textContent=cap?`${cap.occupied} / ${cap.eligible} eligible slots occupied · ${cap.free} immediately free · ${fmt(waiting.total)} waiting in Star Gate${waiting.held?` (${fmt(waiting.core)} core + ${fmt(waiting.held)} Continuity Door)`:''}`:'Gateway status is unavailable';
+  $('capacity-meter').value=cap?.percent||0;$('capacity-meter').hidden=cap?.percent==null;
+  $('continuity-door-status').textContent=s.continuity_door_error?`${s.continuity_door_error}.`:!door?'Continuity Door is not enabled.':door.holding?`Continuity Door holding ${fmt(door.held)} new request${door.held===1?'':'s'} while ${door.core_ready?'core dispatch is ready':'core dispatch is not ready (including when every eligible server is paused or unavailable)'}; existing streams remain connected.`:`Continuity Door ready · ${fmt(door.active)} active proxied stream${door.active===1?'':'s'} · no request-body spooling or replay.`;
+  visibleWorkers=g?.workers??[];workerUiStale=stale;workerControlsVisible=s.worker_management===true;
+  $('capacity-note').title=stale?'Live gateway status is unavailable.':!g?.total?'No model servers are registered. Open Settings to add your first endpoint.':schedulingExplanation(g,visibleWorkers,cap).trim();
+  const routing=buildRoutingSummary(s,g,visibleWorkers,stale);
+  $('routing-summary').hidden=routing.hidden;
+  $('routing-summary').className='routing-summary '+routing.level;
+  $('routing-summary').textContent=routing.text;
+  if(s.fleet_power?.control&&workerControlsReady&&!fleetPowerPolling){fleetPowerPolling=true;void fetch('/api/workers/power',{headers:{}}).then(r=>r.ok?r.json():null).then(p=>{fleetPower=p&&p.enabled!==undefined?p:null;renderDevices(lastDevicesSpec.devices,lastDevicesSpec.workers,lastDevicesSpec.now,lastDevicesSpec.stale,lastDevicesSpec.scales,lastDevicesSpec.controls);}).catch(()=>{}).finally(()=>{fleetPowerPolling=false;});}
+  lastDevicesSpec={devices:s.devices.map(d=>({...d,cache_continuity:s.cache_continuity,performance_history:s.performance_lights})),workers:visibleWorkers,now,stale,scales,controls:workerControlsVisible};
+  renderDevices(lastDevicesSpec.devices,lastDevicesSpec.workers,now,stale,scales,workerControlsVisible);
+  renderCatalogue(s,now);
+  const ds=g?.dataset;
+  $('cache-evidence-status').textContent=cacheEvidenceText(s,stale);
+  const selector=$('cache-cost-worker'),selected=selector.value,options=(g?.workers||[]).map(w=>`<option value="${esc(w.id)}">${esc(w.id)}</option>`).join('');
+  if(selector.innerHTML!==options){selector.innerHTML=options;if((g?.workers||[]).some(w=>w.id===selected))selector.value=selected;}
+  $('dataset-status').textContent=stale?'Collector status stale':!ds?.enabled?'Collector not enabled':ds.error||'Collecting routing evidence';
+  $('dataset-detail').textContent=ds?`${fmt(ds.written)} events saved this gateway run · ${fmt(ds.bytes/1048576)} MiB stored · ${fmt(ds.pending)} pending · ${fmt(ds.dropped)} dropped · ${fmt(ds.finished)} finishes (${fmt(ds.missing_usage)} missing usage, ${fmt(ds.truncated)} output-limited, ${fmt(ds.failed_or_cancelled)} failed/cancelled) · last write ${age(ds.last_write,now)}`:'Existing engine metrics are separate from the new request dataset.';
+  $('worker-management').hidden = !s.worker_management;
+  $('tab-settings').hidden=!s.worker_management;
+  $('control-mode').closest('.read-only').hidden=!!s.worker_management;
+  $('control-mode').hidden=!!s.worker_management;
+  $('control-mode').textContent='[ read only ]';
+  $('control-note').hidden=!!s.worker_management;
+  $('control-note').textContent = 'No model controls.';
+  if(s.worker_management) {
+    if(globalThis.location?.hash==='#settings'&&currentWorkspace!=='settings')activateWorkspaceTab('settings');
+    wireWorkerControls(); void loadWorkers();
+  } else if(currentWorkspace==='settings')activateWorkspaceTab('fleet',{updateHash:true});
+  renderRequests(s.events);
+  renderGenieActionLedger();
+  $('updated').textContent = `Gateway checked ${s.gateway_at ? clock(s.gateway_at) : '—'} · dashboard started ${clock(s.started)}`;
+}
+let lanSharingToken=null,lanSharingEnabled=false,lanSharingBusy=false;
+function renderLanSharing(value){
+  const panel=$('lan-sharing-control'),toggle=$('lan-sharing-toggle');if(!panel||!toggle)return;
+  panel.hidden=!value?.available;if(!value?.available)return;
+  lanSharingToken=value.csrf_token;lanSharingEnabled=value.enabled;
+  toggle.disabled=lanSharingBusy;toggle.setAttribute('aria-checked',String(value.enabled));toggle.textContent=value.enabled?'On':'Off';
+  $('lan-sharing-details').hidden=!value.enabled;
+  $('lan-sharing-url').value=value.urls?.[0]??'No LAN address available';
+  $('lan-sharing-key').value=value.api_key??'';
+  $('lan-sharing-fallback').hidden=!value.hostname_url;
+  $('lan-sharing-ip').value=value.ip_urls?.[0]??'';
+}
+async function loadLanSharing(){
+  if(lanSharingBusy)return;
+  try{const response=await fetch('/api/lan-sharing',{signal:AbortSignal.timeout(5000)});if(!response.ok)throw new Error();renderLanSharing(await response.json());}
+  catch{const toggle=$('lan-sharing-toggle');if(toggle)toggle.disabled=true;}
+}
+async function toggleLanSharing(){
+  if(lanSharingBusy||!lanSharingToken)return;lanSharingBusy=true;$('lan-sharing-toggle').disabled=true;$('lan-sharing-message').textContent='';
+  try{
+    const response=await fetch('/api/lan-sharing',{method:'POST',headers:{'content-type':'application/json','x-dsg-csrf':lanSharingToken},body:JSON.stringify({enabled:!lanSharingEnabled}),signal:AbortSignal.timeout(10000)});
+    const value=await response.json();if(!response.ok)throw new Error(value.error||'LAN sharing change failed');renderLanSharing(value);
+    $('lan-sharing-message').textContent=value.enabled?'Sharing on LAN.':'LAN sharing off. Active responses finish normally.';
+  }catch(error){$('lan-sharing-message').textContent=error.message;}
+  finally{lanSharingBusy=false;await loadLanSharing();}
+}
+let dashboardLanToken=null,dashboardLanEnabled=false,dashboardLanBusy=false;
+function renderDashboardLan(value){
+  const panel=$('dashboard-lan-control'),toggle=$('dashboard-lan-toggle');if(!panel||!toggle)return;
+  panel.hidden=!value?.available;if(!value?.available)return;
+  dashboardLanToken=value.csrf_token;dashboardLanEnabled=value.enabled===true;
+  toggle.disabled=dashboardLanBusy;toggle.setAttribute('aria-checked',String(value.enabled===true));toggle.textContent=value.enabled===true?'On':'Off';
+  $('dashboard-lan-details').hidden=!value.enabled;
+  $('dashboard-lan-urls').value=(value.urls??[]).join('\n')||'No LAN address available';
+}
+async function loadDashboardLan(){
+  if(dashboardLanBusy)return;
+  try{const response=await fetch('/api/dashboard-lan',{signal:AbortSignal.timeout(5000)});if(!response.ok)throw new Error();renderDashboardLan(await response.json());}
+  catch{const toggle=$('dashboard-lan-toggle');if(toggle)toggle.disabled=true;}
+}
+async function toggleDashboardLan(){
+  if(dashboardLanBusy||!dashboardLanToken)return;dashboardLanBusy=true;$('dashboard-lan-toggle').disabled=true;$('dashboard-lan-message').textContent='';
+  try{
+    const response=await fetch('/api/dashboard-lan',{method:'POST',headers:{'content-type':'application/json','x-dsg-csrf':dashboardLanToken},body:JSON.stringify({enabled:!dashboardLanEnabled}),signal:AbortSignal.timeout(10000)});
+    const value=await response.json();if(!response.ok)throw new Error(value.error||'Dashboard LAN change failed');renderDashboardLan(value);
+    $('dashboard-lan-message').textContent=value.enabled?'Serving on local network after the next gateway restart. Browsers must sign in with the gateway API key.':'Dashboard LAN serving off; loopback only again.';
+  }catch(error){$('dashboard-lan-message').textContent=error.message;}
+  finally{dashboardLanBusy=false;await loadDashboardLan();}
+}
+let testingToken=null,testingEnabled=false,testingBusy=false;
+function renderTesting(value){
+  const toggle=$('testing-toggle'),line=$('testing-status');if(!toggle||!line)return;
+  if(!value?.available){toggle.disabled=true;toggle.textContent='Testing unavailable';line.hidden=true;return;}
+  testingToken=value.csrf_token;testingEnabled=value.testing.enabled;
+  toggle.disabled=testingBusy;toggle.setAttribute('aria-checked',String(testingEnabled));toggle.textContent=testingEnabled?'Testing on':'Testing off';
+  line.hidden=!testingEnabled;
+  const draining=value.testing.normal_active>0||value.genie_draining;
+  $('testing-summary').textContent=testingEnabled?`${draining?'Existing work finishing':'Testing active'} · ${value.testing.held} normal requests waiting · Genie suspended`:'';
+  const field=$('testing-url');if(field.value!==value.endpoint)field.value=value.endpoint;
+}
+async function loadTesting(){
+  if(testingBusy)return;
+  try{const response=await fetch('/api/testing',{signal:AbortSignal.timeout(5000)});if(!response.ok)throw new Error();renderTesting(await response.json());}
+  catch{const button=$('testing-toggle');if(button){button.disabled=true;button.textContent='Testing status unavailable';}}
+}
+async function toggleTesting(){
+  if(testingBusy||!testingToken)return;testingBusy=true;$('testing-toggle').disabled=true;
+  try{const response=await fetch('/api/testing',{method:'POST',headers:{'content-type':'application/json','x-dsg-csrf':testingToken},body:JSON.stringify({enabled:!testingEnabled}),signal:AbortSignal.timeout(10000)});const value=await response.json();if(!response.ok)throw new Error(value.error||'Testing change failed');renderTesting(value);}
+  catch(error){$('testing-status').hidden=false;$('testing-summary').textContent=error.message;}
+  finally{testingBusy=false;await loadTesting();void loadGenie();}
+}
+async function poll() {
+  try {
+    const [r]=await Promise.all([fetch('/api/status',{cache:'no-store',signal:AbortSignal.timeout(5000)}),
+      fetch('/api/fleet-workloads',{cache:'no-store',signal:AbortSignal.timeout(2000)}).then(async response=>{if(!response.ok)throw Error();fleetWorkloads=await response.json();fleetWorkloadsUnavailable=false;}).catch(()=>{fleetWorkloadsUnavailable=true;})]);
+    if(!r.ok)throw Error();render(await r.json());
+  }
+  catch { workerUiStale=true;refreshRoutingControls();$('connection').textContent = 'Disconnected'; $('warning').hidden = false; $('warning').textContent = 'Dashboard connection lost. Values below are historical, not live.'; renderHealthWire({time:Date.now(),gateway_error:true}); }
+  finally { setTimeout(poll, document.hidden ? 10000 : 2000); }
+}
+let controlsWired = false, workerBusy = false, workersLoading = false, csrfToken = null,recoveryState=null;
+let workerControlsReady=false,workerControlsVisible=false,workerUiStale=true,visibleWorkers=[];
+let fleetPower=null,fleetPowerBusy=new Set(),fleetPowerPolling=false,lastDevicesSpec=null;
+let endpointEdit=null, registeredWorkers=[];
+let contextDirty=false, contextExpected=null;
+let queueDirty=false,queueExpected=null;
+let turnsDirty=false,turnsExpected=null;
+let visionProtectionEnabled=false;
+let directReserveEnabled=false;
+function workerMessage(text, error = false) {
+  $('worker-message').textContent = text; $('worker-message').classList.toggle('error',error);
+  $('routing-message').textContent=text;$('routing-message').classList.toggle('error',error);
+}
+function workerRows(workers) {
+  return workers.map(w=>{
+    const busy=!!w.load || w.queued>0;
+    const holds=w.holds??[],held=holds.length>0,locks=w.maintenance_locks??[],locked=locks.length>0;
+    const info=routingInfo(w,{recovering:recoveryState?.workers?.some(r=>r.worker_id===w.id&&r.state==='recovering')});
+    const routing=info.label;
+    const id=esc(w.id);
+    const ownership=`${w.operator_paused?'<br><small>Operator pause</small>':''}${holds.map(h=>`<br><small>Held by ${esc(h.owner_id)}${h.reason?`: ${esc(h.reason)}`:''}</small>`).join('')}${locks.map(lock=>`<br><small class="maintenance-lock${Number.isFinite(lock.review_at)&&lock.review_at<=Date.now()?' overdue':''}">Maintenance: ${esc(lock.name)}${lock.reason?` · ${esc(lock.reason)}`:''}${Number.isFinite(lock.review_at)?` · review ${lock.review_at<=Date.now()?'overdue':`in ${remaining(lock.review_at,Date.now())}`}`:' · no automatic expiry'}</small>`).join('')}`;
+    const routes=w.ssh?`<button class="button" title="Edit only the host-key-verified SSH fallback aliases. The current inference stream and primary route are not interrupted; the new list applies on the next reconnect." data-action="fallbacks" data-id="${id}" ${workerBusy?'disabled':''}>Routes ${fmt(1+(w.ssh_fallbacks?.length??0))}</button>`:'';
+    const lockActions=locks.map(lock=>`<button class="button" title="Release only ${esc(lock.name)}. The server stays paused until a separate checked Resume." data-action="unlock" data-id="${id}" data-lock-id="${esc(lock.id)}" ${workerBusy?'disabled':''}>Release ${esc(lock.name)}</button>`).join('');
+    return `<tr><td>${id}<br><small class="muted">${esc(w.url??'')}</small>${Object.entries(w.model_aliases??{}).map(([alias,id])=>`<br><small>Model: ${esc(alias)} → ${esc(id)}</small>`).join('')}</td><td>${fmt(w.context_length)}</td><td title="${esc(info.detail)}">${routing}${ownership}</td><td>${fmt(w.load)} / ${fmt(w.queued)}</td><td class="worker-actions"><button class="button" title="${esc(info.title)}" data-action="${info.action}" data-id="${id}" ${workerBusy||info.blocked?'disabled':''}>${info.button}</button><button class="button" title="Create a named durable maintenance lock. It immediately stops new admission and never auto-expires." data-action="lock" data-id="${id}" ${workerBusy?'disabled':''}>Maintenance lock</button>${lockActions}${held&&!w.operator_paused?`<button class="button" title="Keep an operator pause even after all agents release their holds." data-action="drain" data-id="${id}" ${workerBusy?'disabled':''}>Keep paused</button>`:''}${routes}<button class="button" data-action="concurrency" data-id="${id}" title="Change gateway request capacity after this worker is paused and idle. Use capacity qualified for its model server." ${workerBusy||!w.drained||busy||w.recovery_waiting||!Number.isSafeInteger(w.max_concurrent_requests)?'disabled':''}>Capacity ${fmt(w.max_concurrent_requests??1)}</button><button class="button" data-action="endpoint" data-id="${id}" ${workerBusy?'disabled':''}>Edit endpoint</button><button class="button" title="Remove registration only after draining and releasing all holds and maintenance locks. Does not stop the model server." data-action="remove" data-id="${id}" ${workerBusy||!w.drained||busy||held||locked?'disabled':''}>Remove</button></td></tr>`;
+  }).join('') || '<tr><td colspan="5">No workers registered.</td></tr>';
+}
+async function loadWorkers() {
+  if(workersLoading||workerBusy)return;
+  workersLoading=true;
+  try {
+    const r=await fetch('/api/workers',{cache:'no-store',signal:AbortSignal.timeout(5000)}), data=await r.json();
+    if(!r.ok||!data.enabled)throw new Error(data.error||'Worker controls unavailable');
+    csrfToken=data.csrf_token;workerControlsReady=true;registeredWorkers=data.workers;
+    // A transient startup/socket race must not leave a permanent red banner
+    // after the authoritative control read succeeds. Preserve non-error action
+    // receipts so the operator still sees what they just requested.
+    if($('routing-message').classList.contains('error')||$('worker-message').classList.contains('error'))workerMessage('');
+    renderRecovery(data.recovery);
+    const rows=workerRows(data.workers);if($('worker-rows').innerHTML!==rows)$('worker-rows').innerHTML=rows;
+    $('pool-context-form').hidden=!data.context_limit_control;
+    $('pool-context-note').hidden=!data.context_limit_control;
+    if(!contextDirty){contextExpected=data.minimum_context;$('pool-context-input').value=String(data.minimum_context);}
+    $('queue-timeout-form').hidden=$('queue-timeout-note').hidden=!data.queue_timeout_control;
+    if(data.queue_timeout_control){
+      $('queue-timeout-current').textContent=`Current: ${fmt(data.queue_timeout_ms/3600000)} hours (${data.queue_timeout_source}).`;
+      if(!queueDirty){queueExpected=data.queue_timeout_ms;$('queue-timeout-input').value=String(data.queue_timeout_ms/3600000);}
+    }
+    $('conversation-turn-control').hidden=!data.conversation_turns_control;
+    if(data.conversation_turns_control){
+      $('conversation-turn-current').textContent=`Up to ${fmt(data.conversation_turns)} consecutive model calls.`;
+      $('conversation-turn-grace').textContent=`Wait up to ${fmt(data.conversation_turn_idle_ms/1000)} seconds for a continuation. Set 1 to use FIFO without this wait.`;
+      if(!turnsDirty){turnsExpected=data.conversation_turns;$('conversation-turn-input').value=String(data.conversation_turns);}
+    }
+    const protection=data.protections?.vision_jpeg;
+    $('vision-protection-control').hidden=!protection;
+    if(protection){
+      visionProtectionEnabled=protection.enabled===true;
+      $('vision-protection-status').textContent=`${visionProtectionEnabled?'ON':'OFF'}${!protection.available?' · guidance only (configure a supported local converter for automatic repair)':''} · ${fmt(protection.rescued)} repaired · ${fmt(protection.guided)} resend notices · ${fmt(protection.failed)} ambiguous/failed retries`;
+      $('vision-protection-toggle').textContent=visionProtectionEnabled?'Disable':'Enable';
+      $('vision-protection-toggle').disabled=workerBusy;
+    }
+    const directReserve=data.direct_reserve_control===true;
+    $('direct-reserve-control').hidden=!directReserve;
+    if(directReserve){
+      directReserveEnabled=data.direct_reserve_enabled===true;
+      const reserved=(data.workers??[]).filter(w=>w.direct_reserved===true).map(w=>w.id);
+      $('direct-reserve-status').textContent=`${directReserveEnabled?'ON':'OFF'}${reserved.length?` · reserved now: ${reserved.join(', ')}`:''}`;
+      $('direct-reserve-toggle').textContent=directReserveEnabled?'Disable':'Enable';
+      $('direct-reserve-toggle').disabled=workerBusy;
+    }
+    const offers=data.queued_relocation?.offers??[];
+    $('relocation-controls').hidden=!data.queued_relocation;
+    $('relocation-offers').replaceChildren(...(offers.length?offers.map(offer=>{
+      const p=document.createElement('p'),button=document.createElement('button');
+      p.append(document.createTextNode(`${offer.source} → ${offer.destination} · waiting ${fmt(offer.waiting_seconds)}s · `));
+      button.type='button';button.className='button';button.dataset.relocation=JSON.stringify(offer);button.textContent='Move queued request';
+      button.disabled=workerBusy;button.title='The request has not reached the model server. Preserve its client socket and deadline, but accept that the destination may not have its warm cache.';
+      p.append(button);return p;
+    }):[document.createTextNode(relocationEmpty(data.queued_relocation?.diagnostics))]));
+  } catch(e) { workerControlsReady=false;workerMessage(e.message,true);$('worker-rows').querySelectorAll('button').forEach(b=>{b.disabled=true;});$('recovery-status').textContent='Recovery controls unavailable; last state is stale';$('recovery-toggle').disabled=true;$('recovery-handback-toggle').disabled=true; }
+  finally { workersLoading=false;refreshRoutingControls(); }
+}
+async function workerAction(action, input) {
+  if(workerBusy)return;
+  if(!csrfToken||!workerControlsReady||workerUiStale){workerMessage('Live worker controls are unavailable; try again once connected.',true);return;}
+  workerBusy=true;
+  refreshRoutingControls();
+  $('worker-form').querySelector('button[type=submit]').disabled=true;
+  $('pool-context-form').querySelector('button').disabled=true;
+  $('queue-timeout-form').querySelector('button').disabled=true;
+  $('conversation-turn-apply').disabled=true;
+  if(action==='conversation-turns'){$('conversation-turn-message').textContent='Applying conversation turn allowance…';$('conversation-turn-message').classList.remove('error');}
+  $('vision-protection-toggle').disabled=true;
+  $('worker-rows').querySelectorAll('button').forEach(b=>{b.disabled=true;});
+  $('relocation-offers').querySelectorAll('button').forEach(b=>{b.disabled=true;});
+  const target=input.workers?.join(', ');
+  workerMessage(action==='context'?'Checking enabled server capacities…':action==='add'||action==='endpoint'?'Checking model and context…':action==='fallbacks'?'Saving verified management-route fallbacks…':action==='resume'?`${target}: checking readiness and any required generation proof…`:'Updating worker routing…');
+  try {
+    const r=await fetch(`/api/workers/${action}`,{method:'POST',headers:{'content-type':'application/json','x-dsg-csrf':csrfToken},body:JSON.stringify(input),signal:AbortSignal.timeout(35000)});
+    const data=await r.json();if(!r.ok)throw new Error(data.error||'Worker control failed');
+    workerMessage(action==='lock'?`${data.result.worker_id}: durable maintenance lock created. Automatic recovery and routing are vetoed until its exact release.`:action==='unlock'?`${data.result.worker_id}: maintenance lock released; routing remains paused until a separate checked Resume.`:action==='recover'?`Recovery accepted: ${data.id}. See executor receipts below.`:action==='recovery-policy'?`Automatic recovery ${data.automatic?'enabled':'disabled'}.`:action==='recovery-handback-policy'?`Verified profile hand-back ${data.profile_handback_automatic?'enabled':'disabled'}. Automatic recovery remains ${data.automatic?'on':'off'}.`:action==='protection'?`Image compatibility protection ${data.vision_jpeg?.enabled?'enabled':'disabled'}. Existing requests and model-server settings are unchanged.`:action==='context'?`Pool limit saved: ${fmt(data.minimum_context)} tokens. Applied now; model servers and Pi unchanged.`:action==='fallbacks'?`Management fallbacks saved. Active inference was not interrupted; the list applies on the next reconnect.`:action==='add'?'Registered paused. Enable routing when ready.':action==='drain'?'Draining. Admitted requests will finish before removal.':action==='remove'?'Removed from this gateway. Model server left running.':action==='relocate'?`${data.source} → ${data.destination}: undispatched request handed over with its original client and deadline.`:'Routing enabled.');
+    if(action==='conversation-turns'){turnsDirty=false;turnsExpected=data.conversation_turns;const message=`Applied: ${fmt(data.conversation_turns)} turns.`;workerMessage('');$('conversation-turn-message').textContent=message;}
+    if(action==='context'){contextDirty=false;contextExpected=data.minimum_context;}
+    if(action==='queue-timeout'){queueDirty=false;queueExpected=data.queue_timeout_ms;workerMessage(`Queue allowance saved: ${fmt(data.queue_timeout_ms/3600000)} hours for new requests. Existing waits and model servers unchanged.`);}
+    if(action==='concurrency')workerMessage(`${input.id}: capacity saved as ${fmt(data.workers?.find(w=>w.id===input.id)?.max_concurrent_requests??input.max_concurrent_requests)}. Routing remains paused.`);
+    if(action==='endpoint'){endpointEdit=null;$('endpoint-edit-form').hidden=true;workerMessage('Endpoint saved. Server remains paused; resume routing when ready.');}
+    if(action==='add')$('worker-form').reset();
+    if(action==='resume')workerMessage(`${target}: routing enabled after checks passed. Model settings unchanged.`);
+    if(action==='drain')workerMessage(`${target}: paused for new work. Admitted requests finish; Resume routing reverses this.`);
+  } catch(e) { workerMessage(`${e.message}. Check the current setting before retrying.`,true);if(action==='conversation-turns'){turnsDirty=false;$('conversation-turn-message').textContent=`${e.message}. Review the refreshed current value before applying again.`;$('conversation-turn-message').classList.add('error');} }
+  finally { workerBusy=false;$('worker-form').querySelector('button[type=submit]').disabled=false;$('pool-context-form').querySelector('button').disabled=false;$('queue-timeout-form').querySelector('button').disabled=false;updateConnectionFields();refreshRoutingControls();void loadWorkers(); }
+}
+function updateConnectionFields() {
+  const form=$('worker-form'), remote=form.elements.connection.value==='ssh', generic=form.elements.backend.value==='openai';
+  $('worker-context-field').hidden=!generic;$('worker-key-field').hidden=!generic;
+  form.elements.context_length.disabled=!generic;form.elements.api_key_file.disabled=!generic;
+  $('ssh-host-field').hidden=!remote;$('ssh-fallback-field').hidden=!remote;$('remote-port-field').hidden=!remote;
+  form.elements.ssh.disabled=!remote;form.elements.ssh.required=remote;form.elements.ssh_fallbacks.disabled=!remote;form.elements.remote_port.disabled=!remote;
+  $('endpoint-label').textContent=remote?'Local tunnel URL (free port)':generic?'API base URL':'Local server URL';
+  form.elements.url.placeholder=remote?'http://127.0.0.1:38003':'http://127.0.0.1:8000';
+}
+function wireWorkerControls() {
+  if(controlsWired)return;controlsWired=true;
+  const editor=$('endpoint-edit-form');
+  function editConnectionFields(){const remote=editor.elements.connection.value==='ssh';for(const id of ['edit-ssh-field','edit-remote-field','edit-fallback-field'])$(id).hidden=!remote;$('edit-url-label').textContent=remote?'Local tunnel URL':'API base URL';}
+  editor.elements.connection.addEventListener('change',editConnectionFields);
+  function connectionValues(fields){return fields.connection.value==='ssh'?{ssh:fields.ssh.value.trim(),remote_port:Number(fields.remote_port.value),ssh_fallbacks:fields.ssh_fallbacks.value.split(',').map(x=>x.trim()).filter(Boolean)}:{ssh:null};}
+  async function testConnection(form,button,result) {
+    if(!csrfToken||!workerControlsReady||workerUiStale)return;
+    const fields=form.elements,worker={id:form===editor?endpointEdit.id:(fields.id.value.trim()||'connection-test'),url:fields.url.value.trim(),backend:fields.backend.value};
+    if(fields.connection.value==='ssh')Object.assign(worker,connectionValues(fields));
+    if(fields.context_length.value)worker.context_length=Number(fields.context_length.value);
+    if(worker.backend==='openai'&&fields.api_key_file.value.trim())worker.api_key_file=fields.api_key_file.value.trim();
+    button.disabled=true;result.textContent='Checking connection…';result.classList.remove('error');
+    try{const response=await fetch('/api/workers/test',{method:'POST',headers:{'content-type':'application/json','x-dsg-csrf':csrfToken},body:JSON.stringify({worker}),signal:AbortSignal.timeout(35000)});const data=await response.json();if(!response.ok)throw new Error(data.error||'Connection failed');result.textContent=`Connected · ${data.model} · ${fmt(data.context_length)} tokens. No changes saved.`;}
+    catch(error){result.textContent=error.message;result.classList.add('error');}finally{button.disabled=false;}
+  }
+  $('endpoint-test').addEventListener('click',()=>void testConnection(editor,$('endpoint-test'),$('endpoint-test-result')));
+  $('worker-test').addEventListener('click',()=>void testConnection($('worker-form'),$('worker-test'),$('worker-test-result')));
+  $('endpoint-edit-cancel').addEventListener('click',()=>{endpointEdit=null;editor.hidden=true;});
+  editor.addEventListener('submit',e=>{e.preventDefault();if(!endpointEdit)return;const input={...endpointEdit,url:editor.elements.url.value.trim(),backend:editor.elements.backend.value,...connectionValues(editor.elements)};if(editor.elements.context_length.value)input.context_length=Number(editor.elements.context_length.value);if(input.backend==='openai')input.api_key_file=editor.elements.api_key_file.value.trim();void workerAction('endpoint',input);});
+  const form=$('worker-form');form.elements.connection.addEventListener('change',updateConnectionFields);form.elements.backend.addEventListener('change',updateConnectionFields);
+  $('pool-context-input').addEventListener('input',()=>{contextDirty=true;});
+  $('conversation-turn-input').addEventListener('input',()=>{turnsDirty=true;$('conversation-turn-message').textContent='';});
+  $('conversation-turn-form').addEventListener('submit',e=>{
+    e.preventDefault();const value=Number($('conversation-turn-input').value);
+    if(!Number.isSafeInteger(value)||value<1){$('conversation-turn-message').textContent='Enter a positive whole number of turns.';return;}
+    void workerAction('conversation-turns',{conversation_turns:value,expected_conversation_turns:turnsExpected});
+  });
+  $('queue-timeout-input').addEventListener('input',()=>{queueDirty=true;});
+  $('queue-timeout-form').addEventListener('submit',e=>{
+    e.preventDefault();const hours=Number($('queue-timeout-input').value),ms=hours*3600000;
+    if(!Number.isSafeInteger(hours)||hours<1||!Number.isSafeInteger(ms)){workerMessage('Enter a positive whole number of hours within the supported integer range.',true);return;}
+    if(ms<queueExpected&&!window.confirm(`Reduce the queue waiting allowance to ${fmt(hours)} hours for new requests? They may expire sooner. Existing queued requests and active generations keep their current deadlines.`))return;
+    void workerAction('queue-timeout',{queue_timeout_ms:ms,expected_queue_timeout_ms:queueExpected});
+  });
+  $('vision-protection-toggle').addEventListener('click',()=>void workerAction('protection',{id:'vision_jpeg',enabled:!visionProtectionEnabled}));
+  $('direct-reserve-toggle').addEventListener('click',()=>void workerAction('direct-reserve',{enabled:!directReserveEnabled}));
+  $('pool-context-form').addEventListener('submit',e=>{
+    e.preventDefault();const value=Number($('pool-context-input').value);
+    if(!Number.isSafeInteger(value)||value<=0){workerMessage('Enter a positive whole token count.',true);return;}
+    if(value<contextExpected&&!window.confirm(`Lower the advertised pool context from ${fmt(contextExpected)} to ${fmt(value)} tokens? This can change client compaction behavior. Model servers and existing requests are not resized.`))return;
+    void workerAction('context',{context_length:value,expected_context_length:contextExpected});
+  });
+  form.addEventListener('submit',e=>{
+    e.preventDefault();const worker={id:form.elements.id.value.trim(),url:form.elements.url.value.trim()};
+    if(form.elements.backend.value==='openai'){
+      worker.backend='openai';
+      if(form.elements.context_length.value)worker.context_length=Number(form.elements.context_length.value);
+      if(form.elements.api_key_file.value.trim())worker.api_key_file=form.elements.api_key_file.value.trim();
+    }
+    if(form.elements.connection.value==='ssh'){
+      worker.ssh=form.elements.ssh.value.trim();worker.remote_port=Number(form.elements.remote_port.value);
+      const fallbacks=[...new Set(form.elements.ssh_fallbacks.value.split(',').map(v=>v.trim()).filter(Boolean))];if(fallbacks.length)worker.ssh_fallbacks=fallbacks;
+    }
+    void workerAction('add',{worker});
+  });
+  const handleWorkerClick=e=>{
+    const button=e.target.closest('button[data-action]');if(!button||button.disabled)return;
+    const {action,id}=button.dataset;
+    if(action==='concurrency'){
+      const worker=registeredWorkers.find(w=>w.id===id);if(!worker)return;
+      const before=worker.max_concurrent_requests??1;
+      const answer=window.prompt(`Concurrent gateway requests for ${id}. Use a capacity already tested with this model server. The server stays paused after saving.`,String(before));if(answer===null)return;
+      const value=Number(answer);if(!Number.isSafeInteger(value)||value<1){workerMessage('Enter a positive whole request capacity.',true);return;}
+      void workerAction('concurrency',{id,expected_max_concurrent_requests:before,max_concurrent_requests:value});return;
+    }
+    if(action==='endpoint'){
+      const worker=registeredWorkers.find(w=>w.id===id);if(!worker)return;
+      endpointEdit={id,expected_url:worker.url};$('endpoint-test-result').textContent='';
+      $('endpoint-edit-title').textContent=`Edit endpoint · ${id}`;
+      editor.elements.connection.value=worker.ssh?'ssh':'local';editor.elements.ssh.value=worker.ssh??'';editor.elements.remote_port.value=worker.remote_port??8000;editor.elements.ssh_fallbacks.value=(worker.ssh_fallbacks??[]).join(', ');editConnectionFields();editor.elements.url.value=worker.url;editor.elements.backend.value=worker.backend??'ds4';editor.elements.context_length.value=worker.context_length??'';editor.elements.api_key_file.value=worker.api_key_file??'';editor.hidden=false;editor.scrollIntoView({block:'center',behavior:'smooth'});editor.elements.url.focus();return;
+    }
+    if(action==='lock'){
+      const name=window.prompt(`Name this maintenance lock for ${id}. It will survive Star Gate restarts and never auto-expire.`,`maintenance-${id}`);if(name===null)return;
+      const reason=window.prompt(`Why must ${id} stay out of Star Gate routing? Do not include secrets or conversation text.`,'External model-server testing in progress');if(reason===null)return;
+      const review=window.prompt('Review reminder in whole hours (optional). This only warns; it never releases the lock.','24');if(review===null)return;
+      const review_after_hours=review.trim()===''?null:Number(review);
+      if((review_after_hours!==null)&&(!Number.isSafeInteger(review_after_hours)||review_after_hours<1||review_after_hours>8760)){workerMessage('Review reminder must be blank or 1–8760 whole hours.',true);return;}
+      void workerAction('lock',{worker_id:id,name:name.trim(),reason:reason.trim(),review_after_hours,request_id:crypto.randomUUID()});return;
+    }
+    if(action==='unlock'){
+      const reason=window.prompt(`Release this exact maintenance lock on ${id}? The server will remain paused until a separate checked Resume.`,'External maintenance completed and verified');if(reason===null)return;
+      void workerAction('unlock',{lock_id:button.dataset.lockId,reason:reason.trim(),request_id:crypto.randomUUID()});return;
+    }
+    if(action==='fallbacks'){
+      const worker=visibleWorkers.find(candidate=>candidate.id===id),before=worker?.ssh_fallbacks??[];
+      const answer=window.prompt(`Fallback SSH aliases for ${id}, comma-separated. Primary route ${worker?.ssh} is unchanged. Leave empty to clear.`,before.join(', '));
+      if(answer===null)return;
+      const fallbacks=[...new Set(answer.split(',').map(value=>value.trim()).filter(Boolean))];
+      void workerAction('fallbacks',{id,expected_ssh_fallbacks:before,ssh_fallbacks:fallbacks});return;
+    }
+    if(action==='remove'&&!window.confirm(`Remove ${id} from the gateway? Its model server and caches will be left running.`))return;
+    if(action==='resume'&&visibleWorkers.find(w=>w.id===id)?.quarantine&&!window.confirm(`Verify and readmit ${id}? Star Gate will check model/context and generate a small test response. Failed checks keep it quarantined. This does not restart the model server or change its settings.`))return;
+    void workerAction(action,action==='remove'?{id}:{workers:[id]});
+  };
+  $('worker-rows').addEventListener('click',handleWorkerClick);
+  $('devices').addEventListener('click',handleWorkerClick);
+  $('relocation-offers').addEventListener('click',e=>{
+    const button=e.target.closest('button[data-relocation]');if(!button||button.disabled)return;
+    const offer=JSON.parse(button.dataset.relocation);
+    if(!window.confirm(`Move this undispatched request from ${offer.source} to ${offer.destination}? Its original client connection and deadline stay intact, but Star Gate cannot prove the destination has its warm cache.`))return;
+    void workerAction('relocate',{request_id:offer.request_id,source:offer.source,destination:offer.destination,evidence_id:offer.evidence_id});
+  });
+}
+function renderGenieReports(reports = []) {
+  const container = $('genie-reports');
+  const existing = new Map([...container.children].map(node => [node.dataset.reportId, node]));
+  const keep = new Set();
+  let position = 0;
+  for (const [index, report] of reports.entries()) {
+    let node = existing.get(report.id);
+    if (index >= 3 && !node?.open && !node?.contains(document.activeElement)) continue;
+    if (keep.has(report.id)) continue;
+    keep.add(report.id);
+    if (!node) {
+      node = document.createElement('details');
+      node.dataset.reportId = report.id;
+      const summary = document.createElement('summary');
+      summary.textContent = `${clock(report.time)} · ${report.source} · ${report.actions_taken?.length?'action requested; see executor receipts':'assessment, no actions'}${report.evidence_at?` · evidence ${clock(report.evidence_at)}`:''}`;
+      const answer = document.createElement('p');
+      answer.className = 'genie-answer';
+      answer.textContent = report.text;
+      if(report.actions_taken?.length)answer.textContent+='\n\nAction request results: '+report.actions_taken.map(a=>`${a.relocation?'relocation '+a.relocation:a.worker_id}: ${a.state??a.status??'pending'}${a.id?` (${a.id})`:''}`).join('; ');
+      if(report.memory_used?.length)answer.textContent+='\n\nHistorical notebook references: '+report.memory_used.map(n=>`${n.id} r${n.revision}`).join(', ');
+      node.append(summary, answer);
+    }
+    // Completed reports are immutable. Keep their actual DOM nodes so polling
+    // cannot reset disclosure state, keyboard focus or a selected passage.
+    if (container.children[position] !== node) container.insertBefore(node, container.children[position] || null);
+    position++;
+  }
+  for (const node of [...container.children]) {
+    // Even a report rotated out of the server's history stays readable until
+    // the reader closes it. This is page-local, not persistent report storage.
+    if (!keep.has(node.dataset.reportId) && !node.open && !node.contains(document.activeElement)) node.remove();
+  }
+}
+function genieActionRows(snapshot,genie,analytics) {
+  const clean=value=>String(value??'').replaceAll('_',' ').replace(/\s+/g,' ').trim().slice(0,240);
+  const rows=[];
+  for(const report of genie?.provider_actions??genie?.reports??[])if(['pool_fallback','pool_assigned'].includes(report.served_by)&&Number.isFinite(report.time))rows.push({
+    id:`provider:${report.id}`,kind:'provider',at:report.time,level:'good',
+    title:`Pool commandeered${report.served_on?` · ${clean(report.served_on)}`:''}`,
+    detail:`${report.served_by==='pool_assigned'?'Pool selected before dispatch':'Dedicated provider unavailable'} · review completed${report.served_on?' on the named Star Gate server':' on an unpinned Star Gate slot; exact server unproven'}`
+  });
+  for(const op of snapshot?.gateway?.recovery?.operations??[])if(op.actor==='genie'&&Number.isFinite(op.updated_at??op.created_at)){
+    const state=clean(op.state),good=['recovered','verified paused'].includes(state),attention=['failed','reconciliation needed'].includes(state);
+    rows.push({id:`recovery:${op.id}`,kind:'recovery',at:op.updated_at??op.created_at,level:attention?'attention':good?'good':'pending',
+      title:`Recovery · ${clean(op.worker_id)}`,detail:`${clean(op.service_action)||'service check'} · ${state}${op.profile_adopted?' · verified profile hand-back':''}${op.proof?' · cache proof recorded':''}`});
+  }
+  for(const move of analytics?.handovers?.rows??[])if(move.actor==='genie'&&Number.isFinite(move.at)){
+    const state=clean(move.service_state),cache=Number.isFinite(move.cached_fraction)?` · ${Math.round(move.cached_fraction*100)}% prompt reused`:'';
+    rows.push({id:`routing:${move.at}:${move.source}:${move.destination}`,kind:'routing',at:move.at,level:state==='complete'?'good':state==='pending'?'pending':'attention',
+      title:`Queue move · ${clean(move.source)} → ${clean(move.destination)}`,detail:`after ${compactWait(move.waiting_before_move_ms/1000)??'an unknown wait'} · ${state}${cache}`});
+  }
+  return rows.sort((a,b)=>b.at-a.at||a.id.localeCompare(b.id)).slice(0,30);
+}
+let genieLedgerSignature='';
+function renderGenieActionLedger() {
+  const rows=genieActionRows(wireSnapshot,genieState,requestHistoryState),filter=$('genie-action-filter')?.value??'all';
+  const visible=rows.filter(row=>filter==='all'?true:filter==='attention'?row.level==='attention':row.kind===filter),attention=rows.filter(row=>row.level==='attention').length;
+  $('genie-action-summary').textContent=rows.length?`${visible.length} shown · latest ${rows.length} available / 30 · newest first${attention?` · ${attention} need attention`:''}`:'No evidenced Genie actions yet';
+  const storageError=genieState?.provider_action_storage?.error||genieState?.provider_assignment_storage?.error;
+  if(storageError)$('genie-action-summary').textContent+=' · pool history not saved';
+  $('genie-action-summary').title=storageError?'Pool action storage needs attention; new receipts remain session-only. Inspect Genie status. Nothing was deleted.':'';
+  const signature=JSON.stringify([filter,visible]);if(signature===genieLedgerSignature)return;
+  const items=visible.map(row=>{
+    const item=document.createElement('li');item.dataset.level=row.level;
+    const time=document.createElement('time'),date=new Date(row.at);
+    if(Number.isFinite(date.getTime()))time.dateTime=date.toISOString();
+    time.textContent=clock(row.at);
+    const title=document.createElement('strong');title.textContent=row.title;
+    const detail=document.createElement('span');detail.textContent=row.detail;detail.title=row.detail;
+    item.append(time,title,detail);return item;
+  });
+  if(!items.length){const empty=document.createElement('li');empty.className='muted';empty.textContent=rows.length?'No actions match this filter.':'Waiting for action evidence.';items.push(empty);}
+  const list=$('genie-action-items'),scrollTop=list.scrollTop;
+  list.replaceChildren(...items);
+  list.scrollTop=scrollTop;
+  // Only a completed render may suppress an identical future refresh.
+  genieLedgerSignature=signature;
+}
+const workspaceNames=['fleet','genie','media','analytics','activity','settings'];
+let currentWorkspace='fleet';
+function activateWorkspaceTab(requested,{focus=false,updateHash=false}={}) {
+  const name=workspaceNames.includes(requested)?requested:'fleet';
+  currentWorkspace=name;
+  for(const button of document.querySelectorAll('[data-workspace-tab]')){
+    const selected=button.dataset.workspaceTab===name;
+    button.setAttribute('aria-selected',String(selected));button.tabIndex=selected?0:-1;
+  }
+  for(const panel of document.querySelectorAll('[data-workspace-view]'))panel.hidden=panel.dataset.workspaceView!==name;
+  if(updateHash&&globalThis.history?.replaceState){
+    const url=new URL(globalThis.location.href);url.hash=name==='fleet'?'':name;globalThis.history.replaceState(null,'',url);
+  }
+  if(focus)document.querySelector(`[data-workspace-tab="${name}"]`)?.focus({preventScroll:true});
+  return name;
+}
+function setupWorkspaceTabs(){
+  const list=document.querySelector('.workspace-tabs');
+  activateWorkspaceTab(globalThis.location?.hash?.slice(1));
+  list.addEventListener('click',event=>{const button=event.target.closest('[data-workspace-tab]');if(button)activateWorkspaceTab(button.dataset.workspaceTab,{updateHash:true});});
+  list.addEventListener('keydown',event=>{
+    const buttons=[...list.querySelectorAll('[data-workspace-tab]:not([hidden])')];
+    const current=buttons.indexOf(event.target.closest('[data-workspace-tab]'));if(current<0)return;
+    const next=event.key==='Home'?0:event.key==='End'?buttons.length-1:event.key==='ArrowRight'||event.key==='ArrowDown'?(current+1)%buttons.length:event.key==='ArrowLeft'||event.key==='ArrowUp'?(current+buttons.length-1)%buttons.length:null;
+    if(next===null)return;event.preventDefault();activateWorkspaceTab(buttons[next].dataset.workspaceTab,{focus:true,updateHash:true});
+  });
+  globalThis.addEventListener?.('hashchange',()=>activateWorkspaceTab(globalThis.location.hash.slice(1)));
+}
+poll();
+$('lan-sharing-toggle')?.addEventListener('click',()=>void toggleLanSharing());
+for(const id of ['lan-sharing-url','lan-sharing-key','lan-sharing-ip'])$(id)?.addEventListener('click',event=>event.currentTarget.select());
+void loadLanSharing();setInterval(()=>{if(!document.hidden)void loadLanSharing();},5000);
+$('dashboard-lan-toggle')?.addEventListener('click',()=>void toggleDashboardLan());
+$('dashboard-lan-urls')?.addEventListener('click',event=>event.currentTarget.select());
+void loadDashboardLan();setInterval(()=>{if(!document.hidden)void loadDashboardLan();},5000);
+$('testing-toggle')?.addEventListener('click',()=>void toggleTesting());
+$('testing-url')?.addEventListener('click',event=>event.currentTarget.select());
+$('testing-copy')?.addEventListener('click',async()=>{
+  const field=$('testing-url'),result=$('testing-copy-result');
+  try{await navigator.clipboard.writeText(field.value);result.textContent='Copied';}
+  catch{field.focus();field.select();result.textContent='URL selected — press Ctrl+C or ⌘C to copy';}
+});
+void loadTesting();setInterval(()=>{if(!document.hidden)void loadTesting();},2000);
+$('genie-action-filter').addEventListener('change',renderGenieActionLedger);
+setupWorkspaceTabs();
+$('request-filter').addEventListener('change',()=>{requestFilter=$('request-filter').value;renderRequests(wireSnapshot?.events??[]);});
+function openServerSettings({focus=false}={}){activateWorkspaceTab('settings',{updateHash:true});const panel=$('worker-management');panel.scrollIntoView({behavior:'smooth',block:'start'});if(focus)panel.querySelector('input[name="id"]')?.focus({preventScroll:true});}
+$('devices').addEventListener('click',event=>{if(!event.target.closest('[data-add-first]'))return;openServerSettings({focus:true});});
+$('fleet-speed-window').addEventListener('change',()=>{const value=$('fleet-speed-window').value;if(!fleetSpeedWindows.has(value))return;fleetSpeedWindow=value;try{globalThis.localStorage?.setItem('dsg-fleet-speed-window-v1',value);}catch{/* Selection still works for this page. */}renderFleetSpeed(requestHistoryState);});
+let cacheCostBusy=false;
+$('cache-cost-form').addEventListener('submit',async event=>{
+  event.preventDefault();if(cacheCostBusy)return;cacheCostBusy=true;
+  const form=event.currentTarget,button=form.querySelector('button');button.disabled=true;
+  const params=new URLSearchParams(new FormData(form));$('cache-cost-result').textContent='Reading measured component costs…';
+  try{const r=await fetch('/api/cache-cost?'+params,{signal:AbortSignal.timeout(5000)}),data=await r.json();if(!r.ok)throw new Error(data.error||'Cost evidence unavailable');$('cache-cost-result').textContent=cacheCostText(data);}
+  catch(e){$('cache-cost-result').textContent=e.message;}
+  finally{button.disabled=false;cacheCostBusy=false;}
+});
+void loadRequestHistory();setInterval(()=>{if(!document.hidden)void loadRequestHistory();},10000);
+$('health-wire').addEventListener('mouseleave',()=>{if(wireSnapshot)renderHealthWire(wireSnapshot);});
+$('health-wire').addEventListener('focusout',()=>queueMicrotask(()=>{if(wireSnapshot)renderHealthWire(wireSnapshot);}));
+let genieToken=null,memoryEditing=null,memoryBusy=false;
+let hardeningSignature=null;
+function renderHardeningNotes(notes=[],memory={}){
+  const panel=$('genie-hardening'),items=$('genie-hardening-items');panel.hidden=!genieState?.configured;
+  const durable=notes.filter(note=>note.durable).length;
+  $('genie-hardening-status').textContent=notes.length?`${fmt(notes.length)} suggestion${notes.length===1?'':'s'} · ${durable} durable · newest first`:`No evidence-backed suggestions yet${memory.enabled?'':' · memory is off'}`;
+  const signature=JSON.stringify(notes);
+  if(signature===hardeningSignature)return;hardeningSignature=signature;
+  items.replaceChildren(...notes.map(note=>{
+    const article=document.createElement('article');article.className='genie-hardening-item';
+    const title=document.createElement('strong');title.textContent=note.title;
+    const meta=document.createElement('p');meta.className='genie-hardening-meta';meta.textContent=`${note.scope??'fleet'} · ${String(note.failure_class??'failure').replaceAll('_',' ')} · evidence ${clock(note.observed_at)} · continuity ${String(note.continuity??'unknown').replaceAll('_',' ')}${note.durable?` · private notebook r${note.revision}`:' · page-local until memory is enabled'}`;
+    const evidence=document.createElement('p');evidence.className='genie-hardening-meta';evidence.textContent=`Observed class: ${String(note.reason??'unknown').replaceAll('_',' ')}`;
+    const suggestion=document.createElement('p');suggestion.textContent=note.suggestion;
+    article.append(title,meta,evidence,suggestion);return article;
+  }));
+}
+function memoryText(note){
+  const d=note.data,yes=v=>v===true?'yes':v===false?'no':'unknown';
+  if(note.kind==='operator_note')return d.text;
+  if(note.kind==='hardening_note')return `${d.title}\n${d.suggestion}\nObserved ${d.failure_class.replaceAll('_',' ')} / ${d.reason.replaceAll('_',' ')} at ${clock(d.observed_at)}. Developer suggestion only; no action or diagnosis is implied.`;
+  if(note.kind==='incident')return `Recorded ${d.reason.replaceAll('_',' ')} at ${clock(d.recorded_at)}.\nRequest: ${d.request_id}\nHistorical incident; check current evidence before acting.`;
+  if(note.kind==='recovery')return `Executor recorded: ${d.state.replaceAll('_',' ')} at ${clock(d.recorded_at)}.\nReceipt: ${d.operation_id}\nThis records a past action, not current health or a cure for the underlying fault.`;
+  return `Gateway healthy: ${yes(d.gateway_healthy)} · paused: ${yes(d.paused)}\nContext: ${fmt(d.context_length)} tokens · agent holds: ${fmt(d.agent_hold_count)}\n${d.quarantine?'Recorded quarantine: '+d.quarantine.replaceAll('_',' ')+'\n':''}Process/cache continuity: unknown. Generation success is not inferred.\n`+(note.recent_transitions??[]).map(p=>`${clock(p.at)}: healthy ${yes(p.data.gateway_healthy)}, paused ${yes(p.data.paused)}, quarantine ${p.data.quarantine??'none observed'}`).join('\n');
+}
+function renderMemory(m){
+  $('memory-status').textContent=m?.error?'· storage needs attention':m?.enabled?'· on':'· off';
+  $('memory-toggle').textContent=m?.enabled?'Turn memory off':'Enable memory';$('memory-toggle').disabled=memoryBusy||(!m?.enabled&&!m?.available);
+  $('memory-note-save').disabled=memoryBusy||!m?.enabled||!m?.available;
+  $('memory-detail').textContent=m?.error||`${fmt(m?.note_count??0)} indexed notes · ${fmt((m?.bytes??0)/1024)} / ${fmt((m?.max_bytes??16777216)/1024)} KiB · ${m?.truncated?'retrieval truncated to 12 notes / 16 KiB':'bounded retrieval'} · off retains records. Old observations are history, not live health.`;
+  const root=$('memory-notes'),existing=new Map([...root.children].map(n=>[n.dataset.noteId,n])),keep=new Set();
+  for(const note of m?.notes??[]){
+    let node=existing.get(note.id);keep.add(note.id);
+    if(!node){node=document.createElement('details');node.dataset.noteId=note.id;node.append(document.createElement('summary'),document.createElement('p'));root.append(node);}
+    if(node.dataset.revision!==String(note.revision)){
+      node.dataset.revision=String(note.revision);node.children[0].textContent=`${note.data.worker??'Fleet'} · ${note.kind.replaceAll('_',' ')} · ${clock(note.at)} · r${note.revision}`;
+      node.children[1].className='genie-answer';node.children[1].textContent=memoryText(note);
+      for(const b of node.querySelectorAll('button'))b.remove();
+      if(note.kind==='operator_note')for(const action of ['edit','archive']){const b=document.createElement('button');b.type='button';b.className='button';b.dataset.memoryAction=action;b.dataset.noteId=note.id;b.textContent=action==='edit'?'Edit':'Archive';node.append(b);}
+    }
+  }
+  for(const node of [...root.children]){
+    const current=keep.has(node.dataset.noteId);
+    if(!current&&!node.open&&!node.contains(document.activeElement)){node.remove();continue;}
+    for(const b of node.querySelectorAll('button'))b.disabled=!current||memoryBusy||!m?.enabled||!m?.available;
+    node.title=current?'':'Retained while you read; not in the current notebook retrieval.';
+  }
+}
+async function genieAction(input) {
+  try {const r=await fetch('/api/genie',{method:'POST',headers:{'content-type':'application/json','x-dsg-csrf':genieToken},body:JSON.stringify(input),signal:AbortSignal.timeout(15000)});
+    const data=await r.json();if(!r.ok)throw new Error(data.error||'Genie request failed');await loadGenie();return data;
+  } catch(e){$('genie-status').textContent=e.name==='TimeoutError'?'Genie chat request timed out before it was accepted; no question receipt was created.':e.message;return null;}
+}
+async function loadGenie() {
+  try {const r=await fetch('/api/genie',{signal:AbortSignal.timeout(5000)});if(!r.ok)throw new Error();const s=await r.json();genieToken=s.csrf_token;genieState=s;wireState={...s.ticker,refreshing:!!s.busy&&!!s.enabled,provider_attempts:s.provider_attempts};
+    if(wireSnapshot)renderHealthWire(wireSnapshot);
+    const now=Date.now(),activeProvider=s.active_provider==='pool_fallback'?'Star Gate pool fallback':['pool','pool_assigned'].includes(s.active_provider)?'Star Gate pool':'dedicated provider',providerProgress=s.busy&&s.provider_started_at?`${activeProvider} · ${age(s.provider_started_at,now)} elapsed${s.provider_deadline_at?` · deadline in ${remaining(s.provider_deadline_at,now)}`:''}`:null;
+    const q=s.question,qtext=q?.state==='queued'?(s.review_kind==='action'?'Your question is queued behind an evidence-gated action review':'Your question is queued; a routine review is being yielded'):q?.state==='answering'?`Answering your question · ${providerProgress??'provider starting…'}`:q?.state==='answered'?`Question answered ${age(q.finished_at,now)}`:['failed','cancelled'].includes(q?.state)?`Question ${q.state}: ${q.error}`:null;
+    const provider=s.last_served_by==='pool_assigned'?' · last review was assigned to free Star Gate capacity before dispatch':s.last_served_by==='pool_fallback'?' · last review used fallback after a proven connection refusal':s.last_served_by==='pool'?' · last review used the Star Gate pool':s.last_served_by==='dedicated'?' · last review used the dedicated provider':'';
+    const attempts=(s.provider_attempts||[]).slice(0,s.error&&s.fallback_available?2:1),attemptText=attempts.length?` · ${attempts.map(attempt=>`${attempt.provider.replaceAll('_',' ')} ${attempt.outcome}${attempt.reason?` (${attempt.reason.replaceAll('_',' ')})`:''}`).join(' · ')}`:'';
+    $('genie-status').textContent=s.suspended_for_testing?(s.busy?'Testing · current review finishing':'Suspended for testing'):!s.configured?'Not configured':!s.enabled?'Off · enable Gate Genie before asking':qtext||(s.error?`${s.error}${attemptText}`:(s.busy?`Scheduled fleet review · ${providerProgress??'provider starting…'}`:`Enabled · last review ${age(s.last_check,now)}${provider}${attemptText}`));
+    $('genie-mode').textContent=s.action_supervision?'evidence-gated actions':'observation';
+    $('genie-toggle').disabled=s.suspended_for_testing||!s.configured;$('genie-toggle').textContent=s.enabled?'Turn off':'Enable';
+    $('genie-source').disabled=s.suspended_for_testing||!s.fallback_available||s.busy;$('genie-source').value=s.source||'primary';
+    $('genie-review').disabled=$('genie-send').disabled=s.suspended_for_testing||!s.enabled||q?.state==='queued'||q?.state==='answering';
+    renderHardeningNotes(s.hardening_notes||[],s.memory||{});
+    renderGenieReports(s.reports || []);
+    renderMemory(s.memory);
+    renderGenieActionLedger();
+  } catch{$('genie-status').textContent='Genie status unavailable';wireState={state:'unavailable'};if(wireSnapshot)renderHealthWire(wireSnapshot);}
+}
+$('genie-toggle').addEventListener('click',()=>genieAction({action:'enable',enabled:!genieState?.enabled}));
+$('genie-source').addEventListener('change',()=>genieAction({action:'source',source:$('genie-source').value}));
+$('genie-review').addEventListener('click',async()=>{if($('genie-review').disabled)return;$('genie-status').textContent='Submitting a fleet review…';$('genie-review').disabled=true;await genieAction({action:'ask'});});
+$('genie-chat').addEventListener('submit',async e=>{
+  e.preventDefault();const question=$('genie-question').value.trim();
+  if(!question){$('genie-status').textContent='Type a question first, or use Review now for the standard fleet review.';$('genie-question').focus();return;}
+  $('genie-status').textContent='Submitting your question…';$('genie-send').disabled=true;
+  const result=await genieAction({action:'ask',question});
+  if(result?.accepted){$('genie-question').value='';$('genie-status').textContent=result.question?.state==='queued'?'Question accepted and queued behind the current review.':'Question accepted; Gate Genie is answering.';}
+});
+$('memory-toggle').addEventListener('click',async()=>{if(memoryBusy)return;memoryBusy=true;renderMemory(genieState?.memory);try{await genieAction({action:'memory',enabled:!genieState?.memory?.enabled});}finally{memoryBusy=false;renderMemory(genieState?.memory);}});
+$('memory-note-cancel').addEventListener('click',()=>{memoryEditing=null;$('memory-note-text').value='';$('memory-note-cancel').hidden=true;});
+$('memory-note-form').addEventListener('submit',async e=>{
+  e.preventDefault();if(memoryBusy)return;memoryBusy=true;renderMemory(genieState?.memory);
+  try{const note={worker:memoryEditing?.data.worker??null,text:$('memory-note-text').value,state:'active',...(memoryEditing?{id:memoryEditing.id,expected_revision:memoryEditing.revision}:{})};
+    const result=await genieAction({action:'memory-note',note});if(result?.memory_receipt){$('memory-message').textContent=`Saved ${result.memory_receipt.id} r${result.memory_receipt.revision}. No permissions changed.`;memoryEditing=null;$('memory-note-text').value='';$('memory-note-cancel').hidden=true;}else $('memory-message').textContent='Note was not saved; inspect the error above.';
+  }finally{memoryBusy=false;renderMemory(genieState?.memory);}
+});
+$('memory-notes').addEventListener('click',async e=>{
+  const b=e.target.closest('button[data-memory-action]');if(!b||memoryBusy)return;const n=genieState?.memory?.notes?.find(n=>n.id===b.dataset.noteId);if(!n)return;
+  if(b.dataset.memoryAction==='edit'){memoryEditing=n;$('memory-note-text').value=n.data.text;$('memory-note-cancel').hidden=false;$('memory-note-text').focus();return;}
+  memoryBusy=true;try{const result=await genieAction({action:'memory-note',note:{id:n.id,expected_revision:n.revision,...n.data,state:'archived'}});$('memory-message').textContent=result?.memory_receipt?'Archived in retrieval; journal history retained.':'Archive was not saved.';}finally{memoryBusy=false;renderMemory(genieState?.memory);}
+});
+void loadGenie();setInterval(loadGenie,5000);
+
+function renderRecovery(state) {
+  recoveryState=state;
+  $('recovery-status').textContent=!state?.configured?'Not configured. Endpoint registration alone grants no restart authority.':`${state.automatic?'Automatic recovery ON · GG + known-fatal watcher':'Automatic recovery OFF · operator recovery available'} · verified profile hand-back ${state.profile_handback_automatic?'ON':'OFF'}`;
+  $('recovery-toggle').textContent=state?.automatic?'Disable automatic recovery':'Enable automatic recovery';
+  $('recovery-toggle').disabled=!state?.configured||workerBusy;
+  $('recovery-handback-toggle').textContent=state?.profile_handback_automatic?'Disable verified profile hand-back':'Enable verified profile hand-back';
+  $('recovery-handback-toggle').disabled=!state?.configured||workerBusy;
+  $('recovery-workers').innerHTML=(state?.workers||[]).map(w=>`<p><strong>${esc(w.worker_id)}</strong> · ${esc(w.state)} · ${esc(w.eligible?(w.profile_handback?.candidate?'verified hand-back eligible':'recovery eligible'):recoveryReasonDetail(w.reason))}${w.profile_handback?.adopted?' · adopted profile active':''} <button type="button" class="button" data-recover="${esc(w.worker_id)}" ${!w.eligible||workerBusy?'disabled':''}>${w.profile_handback?.candidate?'Verify hand-back':'Recover'}</button>${recoveryRecheckable(w.last_action)?` <button type="button" class="button" data-recheck="${esc(w.last_action.id)}" ${workerBusy?'disabled':''}>Recheck only</button>`:''}</p>`).join('');
+  // Plain text receipts, not another auto-collapsing disclosure panel.
+  $('recovery-actions').replaceChildren(...(state?.operations||[]).slice(0,8).map(op=>{
+    const p=document.createElement('p');p.textContent=`${clock(op.updated_at)} · ${op.worker_id} · ${op.actor}${recoveryIssuanceText(op)} · ${op.state.replaceAll('_',' ')}${op.error?` · ${op.error.replaceAll('_',' ')}`:''}${op.proof?` · ${op.proof.samples.map(s=>`${s.label}: ${s.cached_tokens}/${s.prompt_tokens} cached`).join(' · ')}`:''} · ${op.id}`;return p;
+  }));
+}
+$('recovery-toggle').addEventListener('click',()=>{
+  if(!recoveryState?.configured)return;
+  if(!recoveryState.automatic&&!window.confirm('Allow GG and the known-fatal watcher to restart registered model services after identity and fault checks? RAM-resident caches are lost; server settings and disk caches are preserved.'))return;
+  void workerAction('recovery-policy',{enabled:!recoveryState.automatic});
+});
+$('recovery-handback-toggle').addEventListener('click',()=>{
+  if(!recoveryState?.configured)return;
+  if(!recoveryState.profile_handback_automatic&&!window.confirm('Enable verified profile hand-back? With automatic recovery also on, Star Gate may adopt a stable changed profile on the same enrolled machine/service after all fixed ownership, fatal/replacement and verification gates pass. Pauses and agent holds still win.'))return;
+  void workerAction('recovery-handback-policy',{enabled:!recoveryState.profile_handback_automatic});
+});
+$('recovery-workers').addEventListener('click',event=>{
+  const recheck=event.target.closest('button[data-recheck]');if(recheck&&!recheck.disabled){void workerAction('recovery-recheck',{action_id:recheck.dataset.recheck});return;}
+  const button=event.target.closest('button[data-recover]');if(!button||button.disabled)return;
+  const worker=recoveryState?.workers.find(w=>w.worker_id===button.dataset.recover);
+  if(worker?.eligible)void workerAction('recover',{worker_id:worker.worker_id,evidence_id:worker.evidence_id,action_id:crypto.randomUUID()});
+});
+
+async function powerAction(worker,action){
+  if(!csrfToken||!workerControlsReady||workerUiStale){workerMessage('Live worker controls are unavailable; try again once connected.',true);return;}
+  if(action==='stop'&&!window.confirm(`Stop ${worker} through its enrolled script?\n\nRefusals apply for active gateway or direct work and for the last healthy LLM. Stopping a Spark pair stops both machines of that pair, including any other model serving there. Shutdown is verified before the card reports Stopped.`))return;
+  fleetPowerBusy.add(worker);
+  if(lastDevicesSpec)renderDevices(lastDevicesSpec.devices,lastDevicesSpec.workers,Date.now(),workerUiStale,lastDevicesSpec.scales,workerControlsVisible);
+  const actionId=crypto.randomUUID();
+  try{
+    const headers={'content-type':'application/json','x-dsg-csrf':csrfToken};
+    if(action!=='status'){
+      const check=await fetch('/api/workers/power',{method:'POST',headers,body:JSON.stringify({worker,power_action:action,action_id:actionId,mode:'check'}),signal:AbortSignal.timeout(30000)});
+      const checkBody=await check.json().catch(()=>({}));
+      if(!check.ok)throw new Error(checkBody.error||'Power preflight failed');
+    }
+    const run=await fetch('/api/workers/power',{method:'POST',headers,body:JSON.stringify({worker,power_action:action,action_id:actionId}),signal:AbortSignal.timeout(30000)});
+    const runBody=await run.json().catch(()=>({}));
+    if(!run.ok)throw new Error(runBody.error||'Power action failed');
+    workerMessage(`${worker}: ${action} accepted; the card shows verified progress.`,false);
+  }catch(e){workerMessage(`${worker} ${action}: ${e.message}`,true);}
+  finally{
+    fleetPowerBusy.delete(worker);
+    if(lastDevicesSpec)renderDevices(lastDevicesSpec.devices,lastDevicesSpec.workers,Date.now(),workerUiStale,lastDevicesSpec.scales,workerControlsVisible);
+  }
+}
+
+// Kept outside the polling card DOM so evidence remains readable and does not
+// expand the machine card. Native dialog supplies keyboard/Escape behavior.
+const performanceDialog=document.createElement('dialog');
+performanceDialog.className='performance-dialog';
+performanceDialog.setAttribute('aria-labelledby','performance-evidence-title');
+performanceDialog.setAttribute('aria-describedby','performance-evidence-detail');
+performanceDialog.innerHTML='<form method="dialog"><button class="button" aria-label="Close performance evidence">Close</button></form><h2 id="performance-evidence-title"></h2><p id="performance-evidence-detail"></p><div class="hardware-evidence-plots"></div>';
+let performanceDialogTarget=null;
+performanceDialog.addEventListener('close',()=>{
+  if(performanceDialogTarget?.id){$(performanceDialogTarget.id)?.focus({preventScroll:true});return;}
+  const card=[...document.querySelectorAll('.device')].find(el=>el.dataset.workerId===performanceDialogTarget?.worker);
+  card?.querySelector(`[data-light="${performanceDialogTarget?.kind}"]`)?.focus({preventScroll:true});
+});
+document.body.append(performanceDialog);
+document.addEventListener('click',event=>{
+  const powerButton=event.target.closest?.('[data-power-action]');if(powerButton&&!powerButton.disabled){void powerAction(powerButton.dataset.powerWorker,powerButton.dataset.powerAction);return;}
+  const button=event.target.closest?.('.performance-light, .temperature-reading, #fleet-speed-value');if(!button)return;
+  performanceDialogTarget={id:button.id,worker:button.closest('.device')?.dataset.workerId,kind:button.dataset.light};
+  performanceDialog.querySelector('h2').textContent=button.dataset.lightTitle;
+  performanceDialog.querySelector('p').textContent=button.dataset.lightDetail;
+  performanceDialog.querySelector('.hardware-evidence-plots').innerHTML=button.dataset.lightChart??'';
+  performanceDialog.showModal();
+});
